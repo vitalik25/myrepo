@@ -1,5 +1,5 @@
 #property strict
-#property version "2.05"
+#property version "2.09"
 #property description "Buy-Martingale EA für XAUUSD Cent-Konten (mit Trailing SL)"
 
 #include <Trade\Trade.mqh>
@@ -11,13 +11,15 @@ CButton m_closeAllButton;
 
 //--- Eingaben
 input double MaxLot = 6.00;
-input double AbstandPips = 350.0;
+input double AbstandPips = 250.0;
 input double TakeProfitPips = 150.0;     // Standard TP
 input double SingleProfitTPPips = 300.0; // Wenn nur 1 Pos offen und im Gewinn
-input int MaxOrderWithMartingale = 8;
+input double DistanceMultiplier = 1.5;
+input int MaxOrderWithMartingale = 10;
 input int MaxOrders = 15;
 input double Martingale = 1.6;
 input double TrailingStopPips = 75.0;
+input double SLAfterBidPips = 20;
 input string EAComment = "BuyMartingaleEA";
 input bool IsTrading = false;
 
@@ -85,7 +87,7 @@ int OnInit()
    ChartSetInteger(0, CHART_SHOW_BID_LINE, true);
    ChartSetInteger(0, CHART_SHOW_ASK_LINE, true);
    ChartSetInteger(0, CHART_SHOW_TRADE_HISTORY, false);
-   ChartSetSymbolPeriod(0, Symbol(), PERIOD_M15);
+   // ChartSetSymbolPeriod(0, Symbol(), PERIOD_M15);
 
    magicNumber = GetPersistentMagicNumber();
    StartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
@@ -127,10 +129,35 @@ void OnTick()
    UpdateTrailingSL();
 
    // --- 5. Nachkauf-Logik ---
-   if (orderCount > 0)
+   // if (orderCount > 0 && orderCount < MaxOrders)
+   // {
+   //    double lastOpen = BuyOrders[orderCount - 1].openPrice;
+   //    if ((lastOpen - bid) >= PipsToPrice(AbstandPips))
+   //    {
+   //       double lot = BerechneLot();
+   //       if (OeffneBuy(lot))
+   //       {
+   //          AktualisiereBuyOrders();
+   //          weightedEntryPrice = BerechneWeightedEntryPrice();
+   //          currentTPPrice = BerechneGemeinsamenTPPrice(TakeProfitPips);
+   //          SetzeTPForAll(currentTPPrice);
+   //       }
+   //    }
+   // }
+
+   if (orderCount > 1 && orderCount < MaxOrders)
    {
-      double lastOpen = BuyOrders[orderCount - 1].openPrice;
-      if ((lastOpen - bid) >= PipsToPrice(AbstandPips) && orderCount < MaxOrders)
+      OrderInfo lastOrder = BuyOrders[orderCount - 1];
+
+      // 1. NEU: Dynamischer Abstand in Points
+      double dynamicDistPips = AbstandPips * MathPow(DistanceMultiplier, orderCount - 1);
+
+      // 2. Berechnung des ZIEL-Einstiegspreises (Letzter Preis MINUS dynamischer Abstand)
+      double nextBuyPrice = lastOrder.openPrice - PipsToPrice(dynamicDistPips);
+
+      // 3. WICHTIGE PRÜFUNG: Ist der aktuelle BID (aktueller Marktpreis) TIEFER als unser ZIEL-Einstiegspreis?
+      // (Hier ist der Schutz eingebaut, dass die nächste Order nicht zu nah am letzten Preis liegt)
+      if (bid <= nextBuyPrice)
       {
          double lot = BerechneLot();
          if (OeffneBuy(lot))
@@ -250,7 +277,7 @@ void UpdateTrailingSL()
    {
       // 2. Berechnung des neuen SL-Preises: Bid-Preis minus Trailing-Abstand (in Pips)
       // Der Abstand, den der SL zum aktuellen Preis hält, wird mit TrailingStopPips beibehalten.
-      double newSL = bid - PipsToPrice(TrailingStopPips); // HIER: TrailingStopPips als Abstand verwendet
+      double newSL = bid - PipsToPrice(SLAfterBidPips);
 
       // NEUER SPREAD-AUSGLEICH
       double currentSpread = ask - bid;
@@ -260,7 +287,7 @@ void UpdateTrailingSL()
       // Wir ziehen den newSL nur nach, wenn er HÖHER ist als der aktuelle SL.
 
       // Zuerst den Break-Even-Preis berechnen (Einstieg + minimaler Puffer für Kosten, z.B. 1 Pip)
-      double breakEvenPrice = weightedPrice + currentSpread + PipsToPrice(3.0); // 1.0 Pip Puffer
+      double breakEvenPrice = weightedPrice + currentSpread + PipsToPrice(5.0); // 1.0 Pip Puffer
 
       // Der neue SL ist der HÖHERE Wert aus (dem berechneten Trailing SL) und (dem Break-Even SL)
       double finalSL = MathMax(newSL, breakEvenPrice);
@@ -314,7 +341,7 @@ double PipValue()
       return point;
 
    // --- Standard-FX-Paare (z. B. EURUSD 1.08854 → 5 Digits) → 1 pip = 10 * point
-   //if (digits == 3 || digits == 5)
+   // if (digits == 3 || digits == 5)
    //   return point * 10.0;
 
    // --- sonst (Indices, Krypto etc.) → 1 pip = point
@@ -589,10 +616,7 @@ void DrawVisuals(double tpPrice)
 }
 
 // Klick auf Button abfangen
-void OnChartEvent(const int id,
-                  const long &lparam,
-                  const double &dparam,
-                  const string &sparam)
+void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
 {
    if (id == CHARTEVENT_OBJECT_CLICK)
    {

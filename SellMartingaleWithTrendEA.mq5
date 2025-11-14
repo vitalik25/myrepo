@@ -1,5 +1,5 @@
 #property strict
-#property version "2.05"
+#property version "2.09"
 #property description "Sell-Martingale EA für XAUUSD Cent-Konten (mit Trailing SL)"
 
 #include <Trade\Trade.mqh>
@@ -11,13 +11,15 @@ CButton m_closeAllButton;
 
 //--- Eingaben
 input double MaxLot = 6.00;
-input double AbstandPips = 350.0;
+input double AbstandPips = 250.0;
 input double TakeProfitPips = 150.0;
 input double SingleProfitTPPips = 300.0;
-input int MaxOrderWithMartingale = 8;
+input double DistanceMultiplier = 1.5;
+input int MaxOrderWithMartingale = 10;
 input int MaxOrders = 15;
 input double Martingale = 1.6;
-input double TrailingStopPips = 75.0;        // ab wieviel Gewinn SL aktiviert wird
+input double TrailingStopPips = 75.0; // ab wieviel Gewinn SL aktiviert wird
+input double SLAfterBidPips = 20;
 input string EAComment = "SellMartingaleEA"; // PASST: Kommentar geändert
 input bool IsTrading = false;
 
@@ -85,7 +87,7 @@ int OnInit()
    ChartSetInteger(0, CHART_SHOW_BID_LINE, true);
    ChartSetInteger(0, CHART_SHOW_ASK_LINE, true);
    ChartSetInteger(0, CHART_SHOW_TRADE_HISTORY, false);
-   ChartSetSymbolPeriod(0, Symbol(), PERIOD_M15);
+   // ChartSetSymbolPeriod(0, Symbol(), PERIOD_M15);
 
    magicNumber = GetPersistentMagicNumber();
    StartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
@@ -135,15 +137,42 @@ void OnTick()
    UpdateTrailingSL();
 
    // --- 7. Nachkauf-Logik (Nachlegen bei Verlust) ---
-   if (orderCount > 0)
+   // if (orderCount > 0)
+   // {
+   //    double lastOpen = SellOrders[orderCount - 1].openPrice;
+   //    if ((ask - lastOpen) >= PipsToPrice(AbstandPips) && orderCount < MaxOrders)
+   //    {
+   //       double lot = BerechneLot();
+   //       if (OeffneSell(lot))
+   //       {
+   //          AktualisiereSellOrders();
+   //          weightedEntryPrice = BerechneWeightedEntryPrice();
+   //          currentTPPrice = BerechneGemeinsamenTPPrice(TakeProfitPips);
+   //          SetzeTPForAll(currentTPPrice);
+   //       }
+   //    }
+   // }
+
+   if (orderCount > 1 && orderCount < MaxOrders)
    {
-      double lastOpen = SellOrders[orderCount - 1].openPrice;
-      if ((ask - lastOpen) >= PipsToPrice(AbstandPips) && orderCount < MaxOrders)
+      OrderInfo lastOrder = SellOrders[orderCount - 1]; // Annahme: Letzte Sell Order
+
+      // --- NEU: Dynamischer Abstand (SPIEGELVERKEHRT FÜR SELL) ---
+      // Basisabstand * (Multiplier ^ Ordernummer)
+      double dynamicDist = AbstandPips * MathPow(DistanceMultiplier, orderCount - 1);
+
+      // Der nächste Einstiegspreis liegt HÖHER als der letzte (Gegen-Trend: Kurs steigt)
+      double nextSellPrice = lastOrder.openPrice + PipsToPrice(dynamicDist);
+
+      // Wenn der aktuelle ASK-Preis den dynamischen Abstand überschreitet
+      if (ask >= nextSellPrice)
       {
-         double lot = BerechneLot();
+         double lot = BerechneLot(); // Lot-Berechnung bleibt gleich
+         // Wichtig: Hier OeffneSell() verwenden!
          if (OeffneSell(lot))
          {
-            AktualisiereSellOrders();
+            // ... Aktualisiere Orders und setze neuen Smart TP ...
+            AktualisiereSellOrders(); // Annahme: Funktion für Sell-Positionen
             weightedEntryPrice = BerechneWeightedEntryPrice();
             currentTPPrice = BerechneGemeinsamenTPPrice(TakeProfitPips);
             SetzeTPForAll(currentTPPrice);
@@ -252,14 +281,14 @@ void UpdateTrailingSL()
    {
       // 2. Berechnung des idealen Trailing SL-Preises:
       // Er liegt ÜBER dem aktuellen ASK-Preis, gesichert durch TrailingStopPips (z.B. 75 Pips)
-      double newTrailingSL = ask + PipsToPrice(TrailingStopPips);
+      double newTrailingSL = ask + PipsToPrice(SLAfterBidPips);
 
       // NEUER SPREAD-AUSGLEICH
       double currentSpread = ask - bid;
 
       // 3. Break-Even-Schutz: SL darf den Einstiegspreis nicht überschreiten (Sell)
       // Wir sichern hier 1 Pip Gewinn
-      double breakEvenPrice = weightedPrice - currentSpread - PipsToPrice(3.0);
+      double breakEvenPrice = weightedPrice - currentSpread - PipsToPrice(5.0);
 
       // 4. Der tatsächliche SL-Preis:
       // Er muss der NIEDRIGSTE Preis sein zwischen (newTrailingSL) und (BreakEvenPrice),
@@ -315,7 +344,7 @@ double PipValue()
       return point;
 
    // --- Standard-FX-Paare (z. B. EURUSD 1.08854 → 5 Digits) → 1 pip = 10 * point
-   //if (digits == 3 || digits == 5)
+   // if (digits == 3 || digits == 5)
    //   return point * 10.0;
 
    // --- sonst (Indices, Krypto etc.) → 1 pip = point
@@ -590,10 +619,7 @@ void DrawVisuals(double tpPrice)
 }
 
 // Klick auf Button abfangen
-void OnChartEvent(const int id,
-                  const long &lparam,
-                  const double &dparam,
-                  const string &sparam)
+void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
 {
    if (id == CHARTEVENT_OBJECT_CLICK)
    {
