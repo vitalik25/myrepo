@@ -24,8 +24,9 @@ input string EAComment = "BuyMartingaleEA";
 input bool IsTrading = false;
 
 // --- Drawdown-Schutz
-input double MaxDrawdownPercent = 50.0; // Bei x % Equity-Verlust alles schließen
+input double MaxDrawdownPercent = 10.0; // Bei x % Equity-Verlust alles schließen
 input bool isDebugEnabled = false;
+input bool isWarnEnabled = true;
 double StartEquity = 0.0;
 
 //--- Farben Visualisierung
@@ -100,6 +101,21 @@ int OnInit()
 //------------------------------------------------------------------
 void OnTick()
 {
+   // --- Pruefen, ob Handel erlaubt ist ---
+   long marketStatus = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_MODE);
+   if ((marketStatus & SYMBOL_TRADE_MODE_FULL) == 0)
+   {
+       // Der EA sollte hier keine Order senden.
+       // SYMBOL_TRADE_MODE_FULL ist in der Regel 2, was den Vollhandel erlaubt.
+       // Wenn 0 oder SYMBOL_TRADE_MODE_CLOSE, ist der Markt zu.
+       
+       // Optional: Log-Eintrag zur Information
+       if (isWarnEnabled)
+           Print("[WARN]: OrderSend verhindert, da Markt geschlossen ist.");
+       
+       return; // Die Funktion beenden, um den OrderSend-Aufruf zu verhindern
+   }
+   
    AktualisiereBuyOrders();
    int orderCount = ArraySize(BuyOrders);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
@@ -129,49 +145,25 @@ void OnTick()
    UpdateTrailingSL();
 
    // --- 5. Nachkauf-Logik ---
-   // if (orderCount > 0 && orderCount < MaxOrders)
-   // {
-   //    double lastOpen = BuyOrders[orderCount - 1].openPrice;
-   //    if ((lastOpen - bid) >= PipsToPrice(AbstandPips))
-   //    {
-   //       double lot = BerechneLot();
-   //       if (OeffneBuy(lot))
-   //       {
-   //          AktualisiereBuyOrders();
-   //          weightedEntryPrice = BerechneWeightedEntryPrice();
-   //          currentTPPrice = BerechneGemeinsamenTPPrice(TakeProfitPips);
-   //          SetzeTPForAll(currentTPPrice);
-   //       }
-   //    }
-   // }
-
-   if (orderCount > 1 && orderCount < MaxOrders)
-   {
-      OrderInfo lastOrder = BuyOrders[orderCount - 1];
-
-      // 1. NEU: Dynamischer Abstand in Points
-      double dynamicDistPips = AbstandPips * MathPow(DistanceMultiplier, orderCount - 1);
-
-      // 2. Berechnung des ZIEL-Einstiegspreises (Letzter Preis MINUS dynamischer Abstand)
-      double nextBuyPrice = lastOrder.openPrice - PipsToPrice(dynamicDistPips);
-
-      // 3. WICHTIGE PRÜFUNG: Ist der aktuelle BID (aktueller Marktpreis) TIEFER als unser ZIEL-Einstiegspreis?
-      // (Hier ist der Schutz eingebaut, dass die nächste Order nicht zu nah am letzten Preis liegt)
-      if (bid <= nextBuyPrice)
-      {
-         double lot = BerechneLot();
-         if (OeffneBuy(lot))
-         {
-            AktualisiereBuyOrders();
-            weightedEntryPrice = BerechneWeightedEntryPrice();
-            currentTPPrice = BerechneGemeinsamenTPPrice(TakeProfitPips);
-            SetzeTPForAll(currentTPPrice);
-         }
-      }
-   }
+    if (orderCount > 0 && orderCount < MaxOrders)
+    {
+       double lastOpen = BuyOrders[orderCount - 1].openPrice;
+       if ((lastOpen - bid) >= PipsToPrice(AbstandPips))
+       {
+          double lot = BerechneLot();
+          if (OeffneBuy(lot))
+          {
+             AktualisiereBuyOrders();
+             weightedEntryPrice = BerechneWeightedEntryPrice();
+             currentTPPrice = BerechneGemeinsamenTPPrice(TakeProfitPips);
+             SetzeTPForAll(currentTPPrice);
+          }
+       }
+    }
 
    DrawVisuals(currentTPPrice);
 }
+
 
 bool HandleOnePositiveOrder(int orderCount, double bid)
 {
@@ -341,8 +333,8 @@ double PipValue()
       return point;
 
    // --- Standard-FX-Paare (z. B. EURUSD 1.08854 → 5 Digits) → 1 pip = 10 * point
-   // if (digits == 3 || digits == 5)
-   //   return point * 10.0;
+    if (digits == 3 || digits == 5)
+      return point * 10.0;
 
    // --- sonst (Indices, Krypto etc.) → 1 pip = point
    return point;
@@ -466,33 +458,109 @@ double BerechneGemeinsamenTPPrice(double tpPips)
 
 //------------------------------------------------------------------
 // Setze TP fuer alle Buys
+//void SetzeTPForAll(double tpPrice)
+//{
+//   MqlTradeRequest req;
+//   MqlTradeResult res;
+//   for (int i = 0; i < ArraySize(BuyOrders); i++)
+//   {
+//      ZeroMemory(req);
+//      ZeroMemory(res);
+//
+//      req.action = TRADE_ACTION_SLTP;
+//      req.position = BuyOrders[i].ticket;
+//      req.symbol = _Symbol;
+//
+//      // Wir behalten den aktuellen SL bei (entweder 0.0 oder der Trailing SL)
+//      req.sl = NormalizeDouble(currentSLPrice, _Digits);
+//      req.tp = NormalizeDouble(tpPrice, _Digits);
+//
+//      if (OrderSend(req, res))
+//      {
+//         if (isDebugEnabled)
+//            PrintFormat("TP/SL aktualisiert fuer Ticket %I64u", BuyOrders[i].ticket);
+//      }
+//      else
+//      {
+//         if (res.comment != "No changes")
+//            if (isDebugEnabled)
+//               PrintFormat("TP/SL-Update fehlgeschlagen fuer Ticket %I64u: %s", BuyOrders[i].ticket, res.comment);
+//      }
+//   }
+//}
+
+//------------------------------------------------------------------
+// Setze TP fuer alle Buys (VERBESSERTE VERSION)
 void SetzeTPForAll(double tpPrice)
 {
    MqlTradeRequest req;
    MqlTradeResult res;
+   
+   // --- NEU: Broker-Anforderungen abrufen ---
+   // Mindestabstand (in Pips/Points) für Stops
+   int stopLevelPips = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   
+   // Aktueller Marktpreis (Ask-Preis ist relevant für Buy-TP)
+   double currentAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   
+   // Umrechnung des Mindestabstands in einen Preis
+   double minDistancePrice = (double)stopLevelPips * _Point;
+   
+   // --- NEU: Minimal erlaubter TP-Preis ---
+   // Der TP muss MINDESTENS (Ask + Mindestabstand) sein.
+   double minSafeTP = currentAsk + minDistancePrice;
+
+   // Den Ziel-TP normalisieren
+   double normalizedTargetTP = NormalizeDouble(tpPrice, _Digits);
+
+   // --- NEU: Prüfen, ob der Ziel-TP sicher ist ---
+   if (normalizedTargetTP < minSafeTP)
+   {
+      if (isDebugEnabled)
+           PrintFormat("TP-Anpassung: Ziel-TP (%.5f) liegt innerhalb der Stop-Level-Zone (Min: %.5f). TP wird leicht erhöht.", 
+                       normalizedTargetTP, minSafeTP);
+                       
+      // Den TP auf den minimal sicheren Abstand setzen, um [Invalid stops] zu vermeiden
+      normalizedTargetTP = NormalizeDouble(minSafeTP + _Point, _Digits); 
+   }
+
+
    for (int i = 0; i < ArraySize(BuyOrders); i++)
    {
-      ZeroMemory(req);
-      ZeroMemory(res);
-
-      req.action = TRADE_ACTION_SLTP;
-      req.position = BuyOrders[i].ticket;
-      req.symbol = _Symbol;
-
-      // Wir behalten den aktuellen SL bei (entweder 0.0 oder der Trailing SL)
-      req.sl = NormalizeDouble(currentSLPrice, _Digits);
-      req.tp = NormalizeDouble(tpPrice, _Digits);
-
-      if (OrderSend(req, res))
+      // --- NEU: Prüfen, ob ein Update überhaupt nötig ist ---
+      double currentPositionTP = 0.0;
+      double currentPositionSL = 0.0;
+      
+      if(PositionSelectByTicket(BuyOrders[i].ticket))
       {
-         if (isDebugEnabled)
-            PrintFormat("TP/SL aktualisiert fuer Ticket %I64u", BuyOrders[i].ticket);
+         currentPositionTP = PositionGetDouble(POSITION_TP);
+         currentPositionSL = PositionGetDouble(POSITION_SL);
       }
-      else
+      
+      // Nur senden, wenn sich der TP oder der SL ändert (vermeidet [No changes])
+      if(MathAbs(currentPositionTP - normalizedTargetTP) > _Point || 
+         MathAbs(currentPositionSL - currentSLPrice) > _Point)
       {
-         if (res.comment != "No changes")
+         ZeroMemory(req);
+         ZeroMemory(res);
+
+         req.action = TRADE_ACTION_SLTP;
+         req.position = BuyOrders[i].ticket;
+         req.symbol = _Symbol;
+         req.sl = NormalizeDouble(currentSLPrice, _Digits);
+         req.tp = normalizedTargetTP; // Verwende den geprüften TP-Wert
+
+         if (OrderSend(req, res))
+         {
             if (isDebugEnabled)
-               PrintFormat("TP/SL-Update fehlgeschlagen fuer Ticket %I64u: %s", BuyOrders[i].ticket, res.comment);
+               PrintFormat("TP/SL aktualisiert fuer Ticket %I64u auf TP %.5f", BuyOrders[i].ticket, normalizedTargetTP);
+         }
+         else
+         {
+            if (res.comment != "No changes")
+               if (isDebugEnabled)
+                  PrintFormat("TP/SL-Update fehlgeschlagen fuer Ticket %I64u: %s", BuyOrders[i].ticket, res.comment);
+         }
       }
    }
 }
