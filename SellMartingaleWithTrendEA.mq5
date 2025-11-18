@@ -1,5 +1,5 @@
 #property strict
-#property version "2.09"
+#property version "2.0.01"
 #property description "Sell-Martingale EA für XAUUSD Cent-Konten (mit Trailing SL)"
 
 #include <Trade\Trade.mqh>
@@ -11,25 +11,24 @@ CButton m_closeAllButton;
 
 //--- Eingaben
 input double MaxLot = 6.00;
-input double AbstandPips = 250.0;
-input double TakeProfitPips = 150.0;
+input double AbstandPips = 600.0;
+input double TakeProfitPips = 100.0;
 input double SingleProfitTPPips = 300.0;
-input double DistanceMultiplier = 1.5;
 input int MaxOrderWithMartingale = 10;
-input int MaxOrders = 15;
-input double Martingale = 1.6;
-input double TrailingStopPips = 75.0; // ab wieviel Gewinn SL aktiviert wird
+input int MaxOrders = 20;
+input double Martingale = 1.2;
+input double TrailingStopPips = 75.0;
 input double SLAfterBidPips = 20;
-input string EAComment = "SellMartingaleEA"; // PASST: Kommentar geändert
 input bool IsTrading = false;
 
 // --- Drawdown-Schutz
-input double MaxDrawdownPercent = 50.0; // Bei x % Equity-Verlust alles schließen
+input double MaxDrawdownPercent = 90.0;
 input bool isDebugEnabled = false;
+input bool isWarnEnabled = true;
 double StartEquity = 0.0;
 
 //--- Farben Visualisierung
-color clrEntry = clrRed; // PASST: Farbe für Sell (Rot)
+color clrEntry = clrRed;
 color clrTP = clrGold;
 bool isTrading = IsTrading;
 
@@ -54,8 +53,6 @@ long chartId = ChartID();
 // Initialisierung
 int OnInit()
 {
-   pipValueCached = PipValue();
-
    int chart_width = (int)ChartGetInteger(chartId, CHART_WIDTH_IN_PIXELS, 0);
    int chart_height = (int)ChartGetInteger(chartId, CHART_HEIGHT_IN_PIXELS, 0);
 
@@ -91,6 +88,7 @@ int OnInit()
 
    magicNumber = GetPersistentMagicNumber();
    StartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   pipValueCached = PipValue();
 
    return (INIT_SUCCEEDED);
 }
@@ -100,9 +98,23 @@ int OnInit()
 //------------------------------------------------------------------
 void OnTick()
 {
-   AktualisiereSellOrders();                           // PASST: Funktionsaufruf geändert
-   int orderCount = ArraySize(SellOrders);             // PASST: Array-Name geändert
-   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK); // PASST: Wir nutzen ASK für SELL-Einstieg/TP
+   // --- Pruefen, ob Handel erlaubt ist ---
+   long marketStatus = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_MODE);
+   if ((marketStatus & SYMBOL_TRADE_MODE_FULL) == 0)
+   {
+       // Der EA sollte hier keine Order senden.
+       // SYMBOL_TRADE_MODE_FULL ist in der Regel 2, was den Vollhandel erlaubt.
+       // Wenn 0 oder SYMBOL_TRADE_MODE_CLOSE, ist der Markt zu.
+       
+       // Optional: Log-Eintrag zur Information
+       if (isWarnEnabled)
+           Print("[WARN]: OrderSend verhindert, da Markt geschlossen ist.");
+       
+       return; // Die Funktion beenden, um den OrderSend-Aufruf zu verhindern
+   }
+   AktualisiereSellOrders();
+   int orderCount = ArraySize(SellOrders);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
 
    if (CheckAndHandleDrawdown())
    {
@@ -137,42 +149,15 @@ void OnTick()
    UpdateTrailingSL();
 
    // --- 7. Nachkauf-Logik (Nachlegen bei Verlust) ---
-   // if (orderCount > 0)
-   // {
-   //    double lastOpen = SellOrders[orderCount - 1].openPrice;
-   //    if ((ask - lastOpen) >= PipsToPrice(AbstandPips) && orderCount < MaxOrders)
-   //    {
-   //       double lot = BerechneLot();
-   //       if (OeffneSell(lot))
-   //       {
-   //          AktualisiereSellOrders();
-   //          weightedEntryPrice = BerechneWeightedEntryPrice();
-   //          currentTPPrice = BerechneGemeinsamenTPPrice(TakeProfitPips);
-   //          SetzeTPForAll(currentTPPrice);
-   //       }
-   //    }
-   // }
-
-   if (orderCount > 1 && orderCount < MaxOrders)
+   if (orderCount > 0  && orderCount < MaxOrders)
    {
-      OrderInfo lastOrder = SellOrders[orderCount - 1]; // Annahme: Letzte Sell Order
-
-      // --- NEU: Dynamischer Abstand (SPIEGELVERKEHRT FÜR SELL) ---
-      // Basisabstand * (Multiplier ^ Ordernummer)
-      double dynamicDist = AbstandPips * MathPow(DistanceMultiplier, orderCount - 1);
-
-      // Der nächste Einstiegspreis liegt HÖHER als der letzte (Gegen-Trend: Kurs steigt)
-      double nextSellPrice = lastOrder.openPrice + PipsToPrice(dynamicDist);
-
-      // Wenn der aktuelle ASK-Preis den dynamischen Abstand überschreitet
-      if (ask >= nextSellPrice)
+      double lastOpen = SellOrders[orderCount - 1].openPrice;
+      if ((ask - lastOpen) >= PipsToPrice(AbstandPips))
       {
-         double lot = BerechneLot(); // Lot-Berechnung bleibt gleich
-         // Wichtig: Hier OeffneSell() verwenden!
+         double lot = BerechneLot();
          if (OeffneSell(lot))
          {
-            // ... Aktualisiere Orders und setze neuen Smart TP ...
-            AktualisiereSellOrders(); // Annahme: Funktion für Sell-Positionen
+            AktualisiereSellOrders();
             weightedEntryPrice = BerechneWeightedEntryPrice();
             currentTPPrice = BerechneGemeinsamenTPPrice(TakeProfitPips);
             SetzeTPForAll(currentTPPrice);
@@ -217,16 +202,9 @@ bool HandleOnePositiveOrder(int orderCount, double ask)
 
 void ChangedAfterManualClosing()
 {
-   // HIER: Prüft und korrigiert den TP, wenn eine Position manuell geschlossen wurde
    double oldWeightedEntryPrice = weightedEntryPrice;
-
-   // Berechne den neuen gewichteten Einstiegspreis
    weightedEntryPrice = BerechneWeightedEntryPrice();
-
-   // Berechne den Basis-TP basierend auf dem NEUEN gewichteten Einstieg
    double newBaseTPPrice = BerechneGemeinsamenTPPrice(TakeProfitPips);
-
-   // Prüfe, ob sich der Einstiegspreis signifikant geändert hat (z.B. > 1 Pip)
    if (MathAbs(weightedEntryPrice - oldWeightedEntryPrice) > PipsToPrice(1.0))
    {
       currentTPPrice = newBaseTPPrice;
@@ -241,13 +219,13 @@ bool OpenFirstOrder(int &orderCount, double ask)
    if (orderCount == 0 && isTrading)
    {
       double lot = BerechneLot();
-      if (OeffneSell(lot)) // PASST: Funktionsaufruf geändert
+      if (OeffneSell(lot))
       {
-         AktualisiereSellOrders(); // PASST: Funktionsaufruf geändert
+         AktualisiereSellOrders();
          orderCount = ArraySize(SellOrders);
          weightedEntryPrice = BerechneWeightedEntryPrice();
          currentTPPrice = BerechneGemeinsamenTPPrice(TakeProfitPips);
-         lowestAskSinceOpen = ask; // PASST: Tracking umgekehrt
+         lowestAskSinceOpen = ask;
          currentSLPrice = 0.0;
          SetzeTPForAll(currentTPPrice);
          DrawVisuals(currentTPPrice);
@@ -325,9 +303,9 @@ void UpdateTrailingSL()
 // --- Hilfsfunktion: State zurücksetzen ---
 void ResetState()
 {
-   ArrayFree(SellOrders); // PASST: Array-Name geändert
+   ArrayFree(SellOrders);
    ClearAllObjects();
-   lowestAskSinceOpen = 0; // PASST: Variable geändert
+   lowestAskSinceOpen = 0;
    currentTPPrice = 0;
    weightedEntryPrice = 0;
 }
@@ -344,8 +322,8 @@ double PipValue()
       return point;
 
    // --- Standard-FX-Paare (z. B. EURUSD 1.08854 → 5 Digits) → 1 pip = 10 * point
-   // if (digits == 3 || digits == 5)
-   //   return point * 10.0;
+   if (digits == 3 || digits == 5)
+     return point * 10.0;
 
    // --- sonst (Indices, Krypto etc.) → 1 pip = point
    return point;
@@ -412,9 +390,9 @@ double BerechneLot()
 
 //------------------------------------------------------------------
 // Positionsermittlung
-void AktualisiereSellOrders() // PASST: Funktionsname geändert
+void AktualisiereSellOrders()
 {
-   ArrayFree(SellOrders); // PASST: Array-Name geändert
+   ArrayFree(SellOrders);
    int total = PositionsTotal();
    for (int i = 0; i < total; i++)
    {
@@ -428,16 +406,16 @@ void AktualisiereSellOrders() // PASST: Funktionsname geändert
       {
          string symbol = PositionGetString(POSITION_SYMBOL);
          if (symbol == _Symbol &&
-             PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL && // PASST: Positionstyp geändert
+             PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL &&
              PositionGetInteger(POSITION_MAGIC) == (long)magicNumber)
          {
             OrderInfo info;
             info.ticket = PositionGetInteger(POSITION_TICKET);
             info.lots = PositionGetDouble(POSITION_VOLUME);
             info.openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-            int n = ArraySize(SellOrders);  // PASST: Array-Name geändert
-            ArrayResize(SellOrders, n + 1); // PASST: Array-Name geändert
-            SellOrders[n] = info;           // PASST: Array-Name geändert
+            int n = ArraySize(SellOrders);
+            ArrayResize(SellOrders, n + 1);
+            SellOrders[n] = info;
          }
       }
    }
@@ -448,10 +426,10 @@ void AktualisiereSellOrders() // PASST: Funktionsname geändert
 double BerechneWeightedEntryPrice()
 {
    double sumLots = 0.0, sumPriceLots = 0.0;
-   for (int i = 0; i < ArraySize(SellOrders); i++) // PASST: Array-Name geändert
+   for (int i = 0; i < ArraySize(SellOrders); i++)
    {
-      sumLots += SellOrders[i].lots;                                // PASST: Array-Name geändert
-      sumPriceLots += SellOrders[i].openPrice * SellOrders[i].lots; // PASST: Array-Name geändert
+      sumLots += SellOrders[i].lots;
+      sumPriceLots += SellOrders[i].openPrice * SellOrders[i].lots;
    }
    if (sumLots <= 0.0)
       return 0.0;
@@ -464,79 +442,121 @@ double BerechneGemeinsamenTPPrice(double tpPips)
    double currentWeighted = BerechneWeightedEntryPrice();
    if (currentWeighted <= 0.0)
       return 0.0;
-   return currentWeighted - PipsToPrice(tpPips); // PASST: TP liegt UNTER Einstieg
+   return currentWeighted - PipsToPrice(tpPips);
 }
 
 //------------------------------------------------------------------
 // TP-Only: Setze TP fuer alle Sells
+//------------------------------------------------------------------
 void SetzeTPForAll(double tpPrice)
 {
    MqlTradeRequest req;
    MqlTradeResult res;
-   for (int i = 0; i < ArraySize(SellOrders); i++) // PASST: Array-Name geändert
+
+   // --- NEU: Broker-Anforderungen abrufen ---
+   int stopLevelPips = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   // Aktueller Marktpreis (Bid-Preis ist relevant für Sell-TP)
+   double currentBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   
+   // Umrechnung des Mindestabstands in einen Preis
+   double minDistancePrice = (double)stopLevelPips * _Point;
+
+   // --- NEU: Maximal erlaubter TP-Preis für SELL ---
+   // Der TP muss NIEDRIGER sein als (Bid - Mindestabstand).
+   double maxSafeTP = currentBid - minDistancePrice;
+
+   // Den Ziel-TP normalisieren
+   double normalizedTargetTP = NormalizeDouble(tpPrice, _Digits);
+
+   // --- NEU: Prüfen, ob der Ziel-TP sicher ist ---
+   // Falls der TP HÖHER ist als erlaubt (zu nah am Preis oder darüber), korrigieren
+   if (normalizedTargetTP > maxSafeTP)
    {
-      ZeroMemory(req);
-      ZeroMemory(res);
+      if (isDebugEnabled)
+           PrintFormat("TP-Anpassung: Ziel-TP (%.5f) zu nah an Bid (MaxSafe: %.5f). TP wird nach unten korrigiert.", 
+                       normalizedTargetTP, maxSafeTP);
+                       
+      // Den TP auf den minimal sicheren Abstand setzen (Bid - Distance - 1 Point)
+      normalizedTargetTP = NormalizeDouble(maxSafeTP - _Point, _Digits); 
+   }
 
-      req.action = TRADE_ACTION_SLTP;
-      req.position = SellOrders[i].ticket; // PASST: Array-Name geändert
-      req.symbol = _Symbol;
-
-      req.sl = NormalizeDouble(currentSLPrice, _Digits);
-      req.tp = NormalizeDouble(tpPrice, _Digits);
-
-      if (OrderSend(req, res))
+   for (int i = 0; i < ArraySize(SellOrders); i++)
+   {
+      // --- NEU: Prüfen, ob Update nötig ist (Redundanz vermeiden) ---
+      double currentPositionTP = 0.0;
+      if(PositionSelectByTicket(SellOrders[i].ticket))
       {
-         if (isDebugEnabled)
-            PrintFormat("TP aktualisiert fuer Ticket %I64u", SellOrders[i].ticket); // PASST: Array-Name geändert
+         currentPositionTP = PositionGetDouble(POSITION_TP);
       }
-      else
+
+      // Nur senden, wenn sich der TP ändert
+      if(MathAbs(currentPositionTP - normalizedTargetTP) > _Point)
       {
-         if (res.comment != "No changes")
+         ZeroMemory(req);
+         ZeroMemory(res);
+         req.action = TRADE_ACTION_SLTP;
+         req.position = SellOrders[i].ticket;
+         req.symbol = _Symbol;
+         req.sl = NormalizeDouble(currentSLPrice, _Digits);
+         req.tp = normalizedTargetTP;
+
+         if (OrderSend(req, res))
+         {
             if (isDebugEnabled)
-               PrintFormat("TP-Update fehlgeschlagen fuer Ticket %I64u: %s", SellOrders[i].ticket, res.comment); // PASST: Array-Name geändert
+               PrintFormat("TP aktualisiert fuer Ticket %I64u auf %.5f", SellOrders[i].ticket, normalizedTargetTP);
+         }
+         else
+         {
+            if (res.comment != "No changes")
+               if (isDebugEnabled)
+                  PrintFormat("TP-Update fehlgeschlagen fuer Ticket %I64u: %s", SellOrders[i].ticket, res.comment);
+         }
       }
    }
 }
 
 //------------------------------------------------------------------
 // Sell-Oeffnung
-bool OeffneSell(double lots) // PASST: Funktionsname geändert
+bool OeffneSell(double lots)
 {
+   string EAComment = "SellMartingaleEA";
    trade.SetExpertMagicNumber((long)magicNumber);
-   bool ok = trade.Sell(lots, NULL, 0, 0, NULL, EAComment); // PASST: trade.Sell
+   bool ok = trade.Sell(lots, NULL, 0, 0, NULL, EAComment);
    if (!ok)
       if (isDebugEnabled)
          PrintFormat("OeffneSell fehlgeschlagen! Lots=%.2f, Comment=%s, Error=%s", lots, EAComment, trade.ResultComment());
       else
-         PrintFormat("SELL geoeffnet: %.2f Lots @ %.5f", lots, SymbolInfoDouble(_Symbol, SYMBOL_BID)); // PASST: BID für SELL
+         PrintFormat("SELL geoeffnet: %.2f Lots @ %.5f", lots, SymbolInfoDouble(_Symbol, SYMBOL_BID));
    return ok;
 }
 
 //------------------------------------------------------------------
 // Alle Sell-Orders schliessen
-void CloseAllSells() // PASST: Funktionsname geändert
+void CloseAllSells()
 {
    MqlTradeRequest req;
    MqlTradeResult res;
-   for (int i = 0; i < ArraySize(SellOrders); i++) // PASST: Array-Name geändert
+   for (int i = 0; i < ArraySize(SellOrders); i++)
    {
       ZeroMemory(req);
       ZeroMemory(res);
       req.action = TRADE_ACTION_DEAL;
       req.symbol = _Symbol;
-      req.position = SellOrders[i].ticket;               // PASST: Array-Name geändert
-      req.volume = SellOrders[i].lots;                   // PASST: Array-Name geändert
-      req.type = ORDER_TYPE_BUY;                         // PASST: Schließen einer SELL-Position erfolgt durch BUY
-      req.price = SymbolInfoDouble(_Symbol, SYMBOL_ASK); // PASST: ASK zum Schließen
+      req.position = SellOrders[i].ticket;
+      req.volume = SellOrders[i].lots;
+      req.type = ORDER_TYPE_BUY;
+      req.price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
       req.deviation = 10;
       req.magic = (long)magicNumber;
 
       if (!OrderSend(req, res))
          if (isDebugEnabled)
-            PrintFormat("Schliessen fehlgeschlagen fuer Ticket %I64u: %s", SellOrders[i].ticket, res.comment); // PASST: Array-Name geändert
+            PrintFormat("Schliessen fehlgeschlagen fuer Ticket %I64u: %s", SellOrders[i].ticket, res.comment);
          else
-            PrintFormat("SELL geschlossen fuer Ticket %I64u", SellOrders[i].ticket); // PASST: Array-Name geändert
+            PrintFormat("SELL geschlossen fuer Ticket %I64u", SellOrders[i].ticket);
+            
+      // WICHTIG: Zyklus beendet → neuen Startpunkt setzen für Drawdown-Berechnung
+      StartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
    }
 }
 
@@ -573,8 +593,6 @@ bool CheckAndHandleDrawdown()
    return false;
 }
 
-//------------------------------------------------------------------
-// Visualisierung
 void ClearAllObjects()
 {
    int total = ObjectsTotal(0, 0, -1);
@@ -592,24 +610,24 @@ void DrawVisuals(double tpPrice)
 {
    ClearAllObjects();
 
-   for (int i = 0; i < ArraySize(SellOrders); i++) // PASST: Array-Name geändert
+   for (int i = 0; i < ArraySize(SellOrders); i++)
    {
-      string name = StringFormat("EA_%s_%I64u_Entry", _Symbol, SellOrders[i].ticket); // PASST: Array-Name geändert
-      ObjectCreate(0, name, OBJ_HLINE, 0, 0, SellOrders[i].openPrice);                // PASST: Array-Name geändert
-      ObjectSetInteger(0, name, OBJPROP_COLOR, clrEntry);                             // PASST: Farbe ist jetzt Rot
+      string name = StringFormat("EA_%s_%I64u_Entry", _Symbol, SellOrders[i].ticket);
+      ObjectCreate(0, name, OBJ_HLINE, 0, 0, SellOrders[i].openPrice);
+      ObjectSetInteger(0, name, OBJPROP_COLOR, clrEntry);
       ObjectSetInteger(0, name, OBJPROP_STYLE, STYLE_DOT);
       ObjectSetInteger(0, name, OBJPROP_WIDTH, 1);
 
-      string label = StringFormat("EA_%s_%I64u_Label", _Symbol, SellOrders[i].ticket);                               // PASST: Array-Name geändert
-      string text = StringFormat("SELL #%d | %.2f lots @ %.2f", i + 1, SellOrders[i].lots, SellOrders[i].openPrice); // PASST: Label geändert
-      ObjectCreate(0, label, OBJ_TEXT, 0, TimeCurrent(), SellOrders[i].openPrice);                                   // PASST: Array-Name geändert
+      string label = StringFormat("EA_%s_%I64u_Label", _Symbol, SellOrders[i].ticket);
+      string text = StringFormat("SELL #%d | %.2f lots @ %.2f", i + 1, SellOrders[i].lots, SellOrders[i].openPrice);
+      ObjectCreate(0, label, OBJ_TEXT, 0, TimeCurrent(), SellOrders[i].openPrice);
       ObjectSetString(0, label, OBJPROP_TEXT, text);
       ObjectSetInteger(0, label, OBJPROP_COLOR, clrEntry);
       ObjectSetInteger(0, label, OBJPROP_FONTSIZE, 8);
       ObjectSetInteger(0, label, OBJPROP_ANCHOR, ANCHOR_LEFT);
 
       double labelOffset = PipValue() * (5 + 10 * i);
-      ObjectMove(0, label, 0, TimeCurrent(), SellOrders[i].openPrice - labelOffset); // PASST: Offset NACH UNTEN
+      ObjectMove(0, label, 0, TimeCurrent(), SellOrders[i].openPrice - labelOffset);
    }
 
    string tpName = "EA_TP_Line_" + _Symbol;
