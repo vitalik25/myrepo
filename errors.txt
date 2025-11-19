@@ -1,0 +1,1 @@
+2025.11.19 16:20:18.567	Core 01	2023.04.28 17:38:18   failed modify #5411 buy 0.02 XAUUSD sl: 1990.38, tp: 1991.43 -> sl: 1990.94, tp: 1982.32 [Invalid stops]
