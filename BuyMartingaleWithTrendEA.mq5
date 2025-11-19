@@ -1,5 +1,5 @@
 #property strict
-#property version "2.0.02"
+#property version "2.0.03"
 #property description "Buy-Martingale EA für XAUUSD Cent-Konten (mit Trailing SL)"
 
 #include <Trade\Trade.mqh>
@@ -11,15 +11,16 @@ CButton m_closeAllButton;
 
 //--- Eingaben
 input double MaxLot = 6.00;
-input double AbstandPips = 600.0;
-input double TakeProfitPips = 120.0;
+input double AbstandPips = 400.0;
+input double TakeProfitPips = 80.0;
 input double SingleProfitTPPips = 300.0;
 input int MaxOrderWithMartingale = 10;
-input int MaxOrders = 35;
-input double Martingale = 1.2;
-input double TrailingStopPips = 75.0;
+input int MaxOrders = 20;
+input double Martingale = 1.3;
+input double TrailingStopPips = 30.0;
 input double SLAfterBidPips = 20;
 input bool IsTrading = false;
+input double DistanceMultiplier = 1.3;
 
 // --- Drawdown-Schutz
 input double MaxDrawdownPercent = 90.0; // Bei x % Equity-Verlust alles schließen
@@ -141,10 +142,38 @@ void OnTick()
    UpdateTrailingSL();
 
    // --- 5. Nachkauf-Logik ---
+    //if (orderCount > 0 && orderCount < MaxOrders)
+    //{
+    //   double lastOpen = BuyOrders[orderCount - 1].openPrice;
+    //   if ((lastOpen - bid) >= PipsToPrice(AbstandPips))
+    //   {
+    //      double lot = BerechneLot();
+    //      if (OeffneBuy(lot))
+    //      {
+    //         AktualisiereBuyOrders();
+    //         weightedEntryPrice = BerechneWeightedEntryPrice();
+    //         currentTPPrice = BerechneGemeinsamenTPPrice(TakeProfitPips);
+    //         SetzeTPForAll(currentTPPrice);
+    //      }
+    //   }
+    //}
+    
+    // --- 5. Nachkauf-Logik ---
     if (orderCount > 0 && orderCount < MaxOrders)
     {
        double lastOpen = BuyOrders[orderCount - 1].openPrice;
-       if ((lastOpen - bid) >= PipsToPrice(AbstandPips))
+       
+       // DYNAMISCHER ABSTAND:
+       // Berechnung: BasisAbstand * (Multiplier hoch AnzahlDerBisherigenOrders)
+       // Beispiel bei Basis 300 & Multi 1.3: 
+       // Order 2 Abstand: 300
+       // Order 3 Abstand: 390
+       // Order 4 Abstand: 507
+       // ...
+       // Order 10 Abstand: ca. 3000 (Das rettet dich im Crash!)
+       double dynamicAbstand = AbstandPips * MathPow(DistanceMultiplier, orderCount - 1);
+
+       if ((lastOpen - bid) >= PipsToPrice(dynamicAbstand))
        {
           double lot = BerechneLot();
           if (OeffneBuy(lot))
