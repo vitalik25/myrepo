@@ -1,5 +1,5 @@
 #property strict
-#property version "2.09"
+#property version "2.0.02"
 #property description "Buy-Martingale EA für XAUUSD Cent-Konten (mit Trailing SL)"
 
 #include <Trade\Trade.mqh>
@@ -11,20 +11,18 @@ CButton m_closeAllButton;
 
 //--- Eingaben
 input double MaxLot = 6.00;
-input double AbstandPips = 250.0;
-input double TakeProfitPips = 150.0;     // Standard TP
-input double SingleProfitTPPips = 300.0; // Wenn nur 1 Pos offen und im Gewinn
-input double DistanceMultiplier = 1.5;
+input double AbstandPips = 600.0;
+input double TakeProfitPips = 120.0;
+input double SingleProfitTPPips = 300.0;
 input int MaxOrderWithMartingale = 10;
-input int MaxOrders = 15;
-input double Martingale = 1.6;
+input int MaxOrders = 35;
+input double Martingale = 1.2;
 input double TrailingStopPips = 75.0;
 input double SLAfterBidPips = 20;
-input string EAComment = "BuyMartingaleEA";
 input bool IsTrading = false;
 
 // --- Drawdown-Schutz
-input double MaxDrawdownPercent = 10.0; // Bei x % Equity-Verlust alles schließen
+input double MaxDrawdownPercent = 90.0; // Bei x % Equity-Verlust alles schließen
 input bool isDebugEnabled = false;
 input bool isWarnEnabled = true;
 double StartEquity = 0.0;
@@ -55,8 +53,6 @@ long chartId = ChartID();
 // Initialisierung
 int OnInit()
 {
-   pipValueCached = PipValue();
-
    int chart_width = (int)ChartGetInteger(chartId, CHART_WIDTH_IN_PIXELS, 0);
    int chart_height = (int)ChartGetInteger(chartId, CHART_HEIGHT_IN_PIXELS, 0);
 
@@ -88,10 +84,10 @@ int OnInit()
    ChartSetInteger(0, CHART_SHOW_BID_LINE, true);
    ChartSetInteger(0, CHART_SHOW_ASK_LINE, true);
    ChartSetInteger(0, CHART_SHOW_TRADE_HISTORY, false);
-   // ChartSetSymbolPeriod(0, Symbol(), PERIOD_M15);
 
    magicNumber = GetPersistentMagicNumber();
    StartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   pipValueCached = PipValue();
 
    return (INIT_SUCCEEDED);
 }
@@ -164,7 +160,6 @@ void OnTick()
    DrawVisuals(currentTPPrice);
 }
 
-
 bool HandleOnePositiveOrder(int orderCount, double bid)
 {
    if (orderCount == 1)
@@ -197,20 +192,11 @@ bool HandleOnePositiveOrder(int orderCount, double bid)
 
 void changedAfterManualClosing()
 {
-   // HIER: Prüft und korrigiert den TP, wenn eine Position manuell geschlossen wurde
    double oldWeightedEntryPrice = weightedEntryPrice;
-
-   // Berechne den neuen gewichteten Einstiegspreis
    weightedEntryPrice = BerechneWeightedEntryPrice();
-
-   // Berechne den Basis-TP basierend auf dem NEUEN gewichteten Einstieg
    double newBaseTPPrice = BerechneGemeinsamenTPPrice(TakeProfitPips);
-
-   // Prüfe, ob sich der Einstiegspreis signifikant geändert hat (z.B. > 1 Pip)
    if (MathAbs(weightedEntryPrice - oldWeightedEntryPrice) > PipsToPrice(1.0))
    {
-      // Der TP wird nach einer manuellen Schließung immer auf den Basis-TP zurückgesetzt,
-      // da das Trailing TP entfernt wurde.
       currentTPPrice = newBaseTPPrice;
       if (isDebugEnabled)
          PrintFormat("[DEBUG] TP-Recalculate nach Order-Aenderung: %.5f", currentTPPrice);
@@ -407,7 +393,6 @@ void AktualisiereBuyOrders()
    int total = PositionsTotal();
    for (int i = 0; i < total; i++)
    {
-      ulong ticket = PositionGetInteger(POSITION_TICKET);
       ulong posTicket = PositionGetTicket(i);
 
       if (posTicket == 0)
@@ -455,39 +440,6 @@ double BerechneGemeinsamenTPPrice(double tpPips)
       return 0.0;
    return currentWeighted + PipsToPrice(tpPips);
 }
-
-//------------------------------------------------------------------
-// Setze TP fuer alle Buys
-//void SetzeTPForAll(double tpPrice)
-//{
-//   MqlTradeRequest req;
-//   MqlTradeResult res;
-//   for (int i = 0; i < ArraySize(BuyOrders); i++)
-//   {
-//      ZeroMemory(req);
-//      ZeroMemory(res);
-//
-//      req.action = TRADE_ACTION_SLTP;
-//      req.position = BuyOrders[i].ticket;
-//      req.symbol = _Symbol;
-//
-//      // Wir behalten den aktuellen SL bei (entweder 0.0 oder der Trailing SL)
-//      req.sl = NormalizeDouble(currentSLPrice, _Digits);
-//      req.tp = NormalizeDouble(tpPrice, _Digits);
-//
-//      if (OrderSend(req, res))
-//      {
-//         if (isDebugEnabled)
-//            PrintFormat("TP/SL aktualisiert fuer Ticket %I64u", BuyOrders[i].ticket);
-//      }
-//      else
-//      {
-//         if (res.comment != "No changes")
-//            if (isDebugEnabled)
-//               PrintFormat("TP/SL-Update fehlgeschlagen fuer Ticket %I64u: %s", BuyOrders[i].ticket, res.comment);
-//      }
-//   }
-//}
 
 //------------------------------------------------------------------
 // Setze TP fuer alle Buys (VERBESSERTE VERSION)
@@ -569,8 +521,9 @@ void SetzeTPForAll(double tpPrice)
 // Buy-Oeffnung
 bool OeffneBuy(double lots)
 {
+   string EAComment = "BuyMartingaleEA";
    trade.SetExpertMagicNumber((long)magicNumber);
-   bool ok = trade.Buy(lots, NULL, 0, 0, NULL, EAComment);
+   bool ok = trade.Buy(lots, NULL, 0, 0, 0, EAComment);
    if (!ok)
       if (isDebugEnabled)
          PrintFormat("OeffneBuy fehlgeschlagen! Lots=%.2f, Comment=%s, Error=%s", lots, EAComment, trade.ResultComment());
@@ -604,6 +557,9 @@ void CloseAllBuys()
          else
             PrintFormat("BUY geschlossen fuer Ticket %I64u", BuyOrders[i].ticket);
    }
+   
+   // Zyklus beendet → neuen Startpunkt setzen
+   StartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
 }
 
 // ------------------------------------------------------------------
