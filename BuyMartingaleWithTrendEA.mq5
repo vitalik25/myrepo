@@ -1,5 +1,5 @@
 #property strict
-#property version "2.0.03"
+#property version "2.0.04"
 #property description "Buy-Martingale EA für XAUUSD Cent-Konten (mit Trailing SL)"
 
 #include <Trade\Trade.mqh>
@@ -11,16 +11,15 @@ CButton m_closeAllButton;
 
 //--- Eingaben
 input double MaxLot = 6.00;
-input double AbstandPips = 400.0;
-input double TakeProfitPips = 80.0;
-input double SingleProfitTPPips = 300.0;
+input double AbstandPips = 600.0;
+input double TakeProfitPips = 100.0;
+input double SingleProfitTPPips = 400.0;
 input int MaxOrderWithMartingale = 10;
-input int MaxOrders = 20;
-input double Martingale = 1.3;
+input int MaxOrders = 35;
+input double Martingale = 1.2;
 input double TrailingStopPips = 30.0;
 input double SLAfterBidPips = 20;
 input bool IsTrading = false;
-input double DistanceMultiplier = 1.3;
 
 // --- Drawdown-Schutz
 input double MaxDrawdownPercent = 90.0; // Bei x % Equity-Verlust alles schließen
@@ -142,38 +141,10 @@ void OnTick()
    UpdateTrailingSL();
 
    // --- 5. Nachkauf-Logik ---
-    //if (orderCount > 0 && orderCount < MaxOrders)
-    //{
-    //   double lastOpen = BuyOrders[orderCount - 1].openPrice;
-    //   if ((lastOpen - bid) >= PipsToPrice(AbstandPips))
-    //   {
-    //      double lot = BerechneLot();
-    //      if (OeffneBuy(lot))
-    //      {
-    //         AktualisiereBuyOrders();
-    //         weightedEntryPrice = BerechneWeightedEntryPrice();
-    //         currentTPPrice = BerechneGemeinsamenTPPrice(TakeProfitPips);
-    //         SetzeTPForAll(currentTPPrice);
-    //      }
-    //   }
-    //}
-    
-    // --- 5. Nachkauf-Logik ---
     if (orderCount > 0 && orderCount < MaxOrders)
     {
        double lastOpen = BuyOrders[orderCount - 1].openPrice;
-       
-       // DYNAMISCHER ABSTAND:
-       // Berechnung: BasisAbstand * (Multiplier hoch AnzahlDerBisherigenOrders)
-       // Beispiel bei Basis 300 & Multi 1.3: 
-       // Order 2 Abstand: 300
-       // Order 3 Abstand: 390
-       // Order 4 Abstand: 507
-       // ...
-       // Order 10 Abstand: ca. 3000 (Das rettet dich im Crash!)
-       double dynamicAbstand = AbstandPips * MathPow(DistanceMultiplier, orderCount - 1);
-
-       if ((lastOpen - bid) >= PipsToPrice(dynamicAbstand))
+       if ((lastOpen - bid) >= PipsToPrice(AbstandPips))
        {
           double lot = BerechneLot();
           if (OeffneBuy(lot))
@@ -293,8 +264,17 @@ void UpdateTrailingSL()
       // Der Stop-Loss muss MINDESTENS den gewichteten Einstiegspreis abdecken.
       // Wir ziehen den newSL nur nach, wenn er HÖHER ist als der aktuelle SL.
 
-      // Zuerst den Break-Even-Preis berechnen (Einstieg + minimaler Puffer für Kosten, z.B. 1 Pip)
-      double breakEvenPrice = weightedPrice + currentSpread + PipsToPrice(5.0); // 1.0 Pip Puffer
+      // FIX: Höherer Puffer für die einzelne Order, um Slippage und Kosten
+      // sicher abzudecken und ein negatives Schließen zu vermeiden.
+      double safetyPufferPips = 10.0;
+      if (ArraySize(BuyOrders) == 1)
+      {
+         // 20 Pips Puffer für die Einzelorder, um garantierten Gewinn zu erzielen
+         safetyPufferPips = 20.0; 
+      }
+
+      // Zuerst den Break-Even-Preis berechnen (Einstieg + minimaler Puffer für Kosten)
+      double breakEvenPrice = weightedPrice + currentSpread + PipsToPrice(safetyPufferPips);
 
       // Der neue SL ist der HÖHERE Wert aus (dem berechneten Trailing SL) und (dem Break-Even SL)
       double finalSL = MathMax(newSL, breakEvenPrice);
@@ -472,78 +452,174 @@ double BerechneGemeinsamenTPPrice(double tpPips)
 
 //------------------------------------------------------------------
 // Setze TP fuer alle Buys (VERBESSERTE VERSION)
+//void SetzeTPForAll(double tpPrice)
+//{
+//   MqlTradeRequest req;
+//   MqlTradeResult res;
+//   
+//   // --- NEU: Broker-Anforderungen abrufen ---
+//   // Mindestabstand (in Pips/Points) für Stops
+//   int stopLevelPips = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+//   
+//   // Aktueller Marktpreis (Ask-Preis ist relevant für Buy-TP)
+//   double currentAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+//   
+//   // Umrechnung des Mindestabstands in einen Preis
+//   double minDistancePrice = (double)stopLevelPips * _Point;
+//   
+//   // --- NEU: Minimal erlaubter TP-Preis ---
+//   // Der TP muss MINDESTENS (Ask + Mindestabstand) sein.
+//   double minSafeTP = currentAsk + minDistancePrice;
+//
+//   // Den Ziel-TP normalisieren
+//   double normalizedTargetTP = NormalizeDouble(tpPrice, _Digits);
+//
+//   // --- NEU: Prüfen, ob der Ziel-TP sicher ist ---
+//   if (normalizedTargetTP < minSafeTP)
+//   {
+//      if (isDebugEnabled)
+//           PrintFormat("TP-Anpassung: Ziel-TP (%.5f) liegt innerhalb der Stop-Level-Zone (Min: %.5f). TP wird leicht erhöht.", 
+//                       normalizedTargetTP, minSafeTP);
+//                       
+//      // Den TP auf den minimal sicheren Abstand setzen, um [Invalid stops] zu vermeiden
+//      normalizedTargetTP = NormalizeDouble(minSafeTP + _Point, _Digits); 
+//   }
+//
+//
+//   for (int i = 0; i < ArraySize(BuyOrders); i++)
+//   {
+//      // --- NEU: Prüfen, ob ein Update überhaupt nötig ist ---
+//      double currentPositionTP = 0.0;
+//      double currentPositionSL = 0.0;
+//      
+//      if(PositionSelectByTicket(BuyOrders[i].ticket))
+//      {
+//         currentPositionTP = PositionGetDouble(POSITION_TP);
+//         currentPositionSL = PositionGetDouble(POSITION_SL);
+//      }
+//      
+//      // Nur senden, wenn sich der TP oder der SL ändert (vermeidet [No changes])
+//      if(MathAbs(currentPositionTP - normalizedTargetTP) > _Point || 
+//         MathAbs(currentPositionSL - currentSLPrice) > _Point)
+//      {
+//         ZeroMemory(req);
+//         ZeroMemory(res);
+//
+//         req.action = TRADE_ACTION_SLTP;
+//         req.position = BuyOrders[i].ticket;
+//         req.symbol = _Symbol;
+//         req.sl = NormalizeDouble(currentSLPrice, _Digits);
+//         req.tp = normalizedTargetTP; // Verwende den geprüften TP-Wert
+//
+//         if (OrderSend(req, res))
+//         {
+//            if (isDebugEnabled)
+//               PrintFormat("TP/SL aktualisiert fuer Ticket %I64u auf TP %.5f", BuyOrders[i].ticket, normalizedTargetTP);
+//         }
+//         else
+//         {
+//            if (res.comment != "No changes")
+//               if (isDebugEnabled)
+//                  PrintFormat("TP/SL-Update fehlgeschlagen fuer Ticket %I64u: %s", BuyOrders[i].ticket, res.comment);
+//         }
+//      }
+//   }
+//}
+
+//------------------------------------------------------------------
+// Setze TP fuer alle Buys (OPTIMIERTE VERSION: PRUEFT AUF BROKER-MINDESTABSTAND)
 void SetzeTPForAll(double tpPrice)
 {
-   MqlTradeRequest req;
-   MqlTradeResult res;
-   
-   // --- NEU: Broker-Anforderungen abrufen ---
-   // Mindestabstand (in Pips/Points) für Stops
-   int stopLevelPips = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
-   
-   // Aktueller Marktpreis (Ask-Preis ist relevant für Buy-TP)
-   double currentAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   
-   // Umrechnung des Mindestabstands in einen Preis
-   double minDistancePrice = (double)stopLevelPips * _Point;
-   
-   // --- NEU: Minimal erlaubter TP-Preis ---
-   // Der TP muss MINDESTENS (Ask + Mindestabstand) sein.
-   double minSafeTP = currentAsk + minDistancePrice;
+    MqlTradeRequest req;
+    MqlTradeResult res;
+    
+    // --- NEU: Broker-Anforderungen abrufen ---
+    // 1. Mindestabstand (in Points) für Stops
+    int stopLevelPoints = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+    
+    // 2. Aktueller Marktpreis
+    double currentBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    double currentAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    
+    // 3. Umrechnung des Mindestabstands in einen Preis
+    double minDistancePrice = (double)stopLevelPoints * _Point;
+    
+    // --- TP-Prüfung (relevant für BUY: muss über Ask sein) ---
+    // Der TP muss MINDESTENS (Ask + Mindestabstand) sein.
+    double minSafeTP = currentAsk + minDistancePrice;
+    double normalizedTargetTP = NormalizeDouble(tpPrice, _Digits);
 
-   // Den Ziel-TP normalisieren
-   double normalizedTargetTP = NormalizeDouble(tpPrice, _Digits);
+    if (normalizedTargetTP < minSafeTP && normalizedTargetTP > 0)
+    {
+        if (isWarnEnabled)
+             PrintFormat("[WARN] TP-Korrektur: Ziel-TP (%.5f) liegt zu nah am Ask (%.5f). Erhöht auf MinSafe: %.5f", 
+                         normalizedTargetTP, currentAsk, minSafeTP);
+                         
+        // TP auf minimal sicheren Abstand + einen Point Puffer setzen
+        normalizedTargetTP = NormalizeDouble(minSafeTP + _Point, _Digits);  
+    }
+    
+    // --- SL-Prüfung (relevant für BUY: muss unter Bid sein) ---
+    // Der SL muss MAXIMAL (Bid - Mindestabstand) sein.
+    double maxSafeSL = currentBid - minDistancePrice;
+    double normalizedSL = NormalizeDouble(currentSLPrice, _Digits);
 
-   // --- NEU: Prüfen, ob der Ziel-TP sicher ist ---
-   if (normalizedTargetTP < minSafeTP)
-   {
-      if (isDebugEnabled)
-           PrintFormat("TP-Anpassung: Ziel-TP (%.5f) liegt innerhalb der Stop-Level-Zone (Min: %.5f). TP wird leicht erhöht.", 
-                       normalizedTargetTP, minSafeTP);
-                       
-      // Den TP auf den minimal sicheren Abstand setzen, um [Invalid stops] zu vermeiden
-      normalizedTargetTP = NormalizeDouble(minSafeTP + _Point, _Digits); 
-   }
+    // Die Prüfung muss nur durchgeführt werden, wenn der SL *aktiv* ist (currentSLPrice > 0)
+    if (normalizedSL > 0 && normalizedSL > maxSafeSL) 
+    {
+         if (isWarnEnabled)
+             PrintFormat("[WARN] SL-Korrektur: Ziel-SL (%.5f) liegt zu nah am Bid (%.5f). Gesenkt auf MaxSafe: %.5f", 
+                         normalizedSL, currentBid, maxSafeSL);
+                         
+         // SL auf maximal sicheren Abstand - einen Point Puffer setzen
+         normalizedSL = NormalizeDouble(maxSafeSL - _Point, _Digits); 
+    }
 
 
-   for (int i = 0; i < ArraySize(BuyOrders); i++)
-   {
-      // --- NEU: Prüfen, ob ein Update überhaupt nötig ist ---
-      double currentPositionTP = 0.0;
-      double currentPositionSL = 0.0;
-      
-      if(PositionSelectByTicket(BuyOrders[i].ticket))
-      {
-         currentPositionTP = PositionGetDouble(POSITION_TP);
-         currentPositionSL = PositionGetDouble(POSITION_SL);
-      }
-      
-      // Nur senden, wenn sich der TP oder der SL ändert (vermeidet [No changes])
-      if(MathAbs(currentPositionTP - normalizedTargetTP) > _Point || 
-         MathAbs(currentPositionSL - currentSLPrice) > _Point)
-      {
-         ZeroMemory(req);
-         ZeroMemory(res);
+    for (int i = 0; i < ArraySize(BuyOrders); i++)
+    {
+        // --- Prüfen, ob ein Update überhaupt nötig ist ---
+        // Dies verhindert unnötige [No changes]-Meldungen und reduziert Serverlast
+        double currentPositionTP = 0.0;
+        double currentPositionSL = 0.0;
+        
+        if(PositionSelectByTicket(BuyOrders[i].ticket))
+        {
+            currentPositionTP = PositionGetDouble(POSITION_TP);
+            currentPositionSL = PositionGetDouble(POSITION_SL);
+        }
+        
+        // Nur senden, wenn sich der TP oder der SL tatsächlich ändert
+        if(MathAbs(currentPositionTP - normalizedTargetTP) > _Point || 
+           MathAbs(currentPositionSL - normalizedSL) > _Point)
+        {
+            ZeroMemory(req);
+            ZeroMemory(res);
 
-         req.action = TRADE_ACTION_SLTP;
-         req.position = BuyOrders[i].ticket;
-         req.symbol = _Symbol;
-         req.sl = NormalizeDouble(currentSLPrice, _Digits);
-         req.tp = normalizedTargetTP; // Verwende den geprüften TP-Wert
+            req.action = TRADE_ACTION_SLTP;
+            req.position = BuyOrders[i].ticket;
+            req.symbol = _Symbol;
+            req.sl = normalizedSL;        // Verwende den geprüften SL-Wert
+            req.tp = normalizedTargetTP;  // Verwende den geprüften TP-Wert
 
-         if (OrderSend(req, res))
-         {
-            if (isDebugEnabled)
-               PrintFormat("TP/SL aktualisiert fuer Ticket %I64u auf TP %.5f", BuyOrders[i].ticket, normalizedTargetTP);
-         }
-         else
-         {
-            if (res.comment != "No changes")
+            if (!OrderSend(req, res))
+            {
+                // Warnung nur anzeigen, wenn es sich nicht um "No changes" handelt
+                if (res.comment != "No changes")
+                {
+                    if (isWarnEnabled)
+                         PrintFormat("TP/SL-Update fehlgeschlagen fuer Ticket %I64u: %s", BuyOrders[i].ticket, res.comment);
+                    else if (isDebugEnabled)
+                         PrintFormat("TP/SL-Update fehlgeschlagen fuer Ticket %I64u: %s", BuyOrders[i].ticket, res.comment);
+                }
+            }
+            else
+            {
                if (isDebugEnabled)
-                  PrintFormat("TP/SL-Update fehlgeschlagen fuer Ticket %I64u: %s", BuyOrders[i].ticket, res.comment);
-         }
-      }
-   }
+                   PrintFormat("TP/SL aktualisiert fuer Ticket %I64u auf SL %.5f / TP %.5f", BuyOrders[i].ticket, normalizedSL, normalizedTargetTP);
+            }
+        }
+    }
 }
 
 //------------------------------------------------------------------
@@ -711,6 +787,10 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
          {
             Print("Manuelles Schließen aller Positionen angefordert.");
             CloseAllBuys();
+            
+            // BUGFIX: Internen Zustand nach manuellem Schließen zurücksetzen
+            ResetState();
+           
             m_tradeButton.Text("RUN");
             m_tradeButton.ColorBackground(clrGreen);
             isTrading = false;
