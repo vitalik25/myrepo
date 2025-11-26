@@ -1,5 +1,5 @@
 #property strict
-#property version "2.0.04"
+#property version "2.0.05"
 #property description "Buy-Martingale EA für XAUUSD Cent-Konten (mit Trailing SL)"
 
 #include <Trade\Trade.mqh>
@@ -17,7 +17,7 @@ input double SingleProfitTPPips = 400.0;
 input int MaxOrderWithMartingale = 10;
 input int MaxOrders = 35;
 input double Martingale = 1.2;
-input double TrailingStopPips = 30.0;
+input double TrailingStopPips = 75.0;
 input double SLAfterBidPips = 20;
 input bool IsTrading = false;
 
@@ -214,7 +214,7 @@ bool OpenFirstOrder(int &orderCount, double bid)
          AktualisiereBuyOrders();
          orderCount = ArraySize(BuyOrders);
          weightedEntryPrice = BerechneWeightedEntryPrice();
-         currentTPPrice = BerechneGemeinsamenTPPrice(TakeProfitPips);
+         currentTPPrice = BerechneGemeinsamenTPPrice(SingleProfitTPPips);
          highestBidSinceOpen = bid;
          currentSLPrice = 0.0;
          SetzeTPForAll(currentTPPrice);
@@ -266,11 +266,11 @@ void UpdateTrailingSL()
 
       // FIX: Höherer Puffer für die einzelne Order, um Slippage und Kosten
       // sicher abzudecken und ein negatives Schließen zu vermeiden.
-      double safetyPufferPips = 10.0;
+      double safetyPufferPips = 30.0;
       if (ArraySize(BuyOrders) == 1)
       {
          // 20 Pips Puffer für die Einzelorder, um garantierten Gewinn zu erzielen
-         safetyPufferPips = 20.0; 
+         safetyPufferPips = 200.0; 
       }
 
       // Zuerst den Break-Even-Preis berechnen (Einstieg + minimaler Puffer für Kosten)
