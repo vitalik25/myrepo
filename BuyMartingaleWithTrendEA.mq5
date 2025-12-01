@@ -1,5 +1,5 @@
 #property strict
-#property version "2.0.05"
+#property version "2.0.07"
 #property description "Buy-Martingale EA für XAUUSD Cent-Konten (mit Trailing SL)"
 
 #include <Trade\Trade.mqh>
@@ -11,9 +11,10 @@ CButton m_closeAllButton;
 
 //--- Eingaben
 input double MaxLot = 6.00;
-input double AbstandPips = 600.0;
+input double AbstandPips = 400.0;
 input double TakeProfitPips = 100.0;
 input double SingleProfitTPPips = 400.0;
+input double DistanceMultiplier = 1.15;
 input int MaxOrderWithMartingale = 10;
 input int MaxOrders = 35;
 input double Martingale = 1.2;
@@ -144,7 +145,17 @@ void OnTick()
     if (orderCount > 0 && orderCount < MaxOrders)
     {
        double lastOpen = BuyOrders[orderCount - 1].openPrice;
-       if ((lastOpen - bid) >= PipsToPrice(AbstandPips))
+       
+       // 1. Berechnung des dynamischen Abstands
+       double dynamicAbstand = AbstandPips;
+       if (orderCount > 1)
+       {
+          // Der Abstand wird basierend auf dem Index der letzten Order (orderCount - 1) berechnet.
+          dynamicAbstand = AbstandPips * MathPow(DistanceMultiplier, orderCount - 1);
+       }
+    
+       // 2. Prüfung: Ist der Abstand zur letzten Order groß genug?
+       if ((lastOpen - bid) >= PipsToPrice(dynamicAbstand))
        {
           double lot = BerechneLot();
           if (OeffneBuy(lot))
@@ -270,7 +281,7 @@ void UpdateTrailingSL()
       if (ArraySize(BuyOrders) == 1)
       {
          // 20 Pips Puffer für die Einzelorder, um garantierten Gewinn zu erzielen
-         safetyPufferPips = 200.0; 
+         safetyPufferPips = 50.0; 
       }
 
       // Zuerst den Break-Even-Preis berechnen (Einstieg + minimaler Puffer für Kosten)
