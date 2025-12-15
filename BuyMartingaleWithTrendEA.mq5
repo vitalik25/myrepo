@@ -1,6 +1,6 @@
 #property strict
-#property version "2.0.08"
-#property description "Buy-Martingale EA für XAUUSD Cent-Konten (Optimized for RoboForex 2-digit)"
+#property version "2.0.07"
+#property description "Buy-Martingale EA für XAUUSD Cent-Konten (mit Trailing SL)"
 
 #include <Trade\Trade.mqh>
 #include <Controls\Button.mqh>
@@ -12,22 +12,18 @@ CButton m_closeAllButton;
 //--- Eingaben
 input double MaxLot = 6.00;
 input double AbstandPips = 400.0;
-input double TakeProfitPips = 150.0; // Increased from 100 to 150
+input double TakeProfitPips = 100.0;
 input double SingleProfitTPPips = 400.0;
 input double DistanceMultiplier = 1.15;
 input int MaxOrderWithMartingale = 10;
 input int MaxOrders = 35;
 input double Martingale = 1.2;
-input double TrailingStopPips = 150.0; // Increased from 75 to 150
-input double SLAfterBidPips = 80; // Increased from 20 to 80
+input double TrailingStopPips = 75.0;
+input double SLAfterBidPips = 20;
 input bool IsTrading = false;
 
-// --- Adaptive TP Settings
-input bool UseAdaptiveTP = true;
-input double AdaptiveTPIncrement = 30.0; // Add 30 pips per order beyond 5
-
 // --- Drawdown-Schutz
-input double MaxDrawdownPercent = 90.0;
+input double MaxDrawdownPercent = 90.0; // Bei x % Equity-Verlust alles schließen
 input bool isDebugEnabled = false;
 input bool isWarnEnabled = true;
 double StartEquity = 0.0;
@@ -74,19 +70,10 @@ int OnInit()
    int x1_trade = x_start;
    int x2_trade = x1_trade + btn_width;
    m_tradeButton.Create(chartId, "TradeButton", 0, x1_trade, y1, x2_trade, y2);
-   
-   // Sync button state with IsTrading input
-   if (isTrading)
-   {
-      m_tradeButton.Text("PAUSE");
-      m_tradeButton.ColorBackground(clrRed);
-   }
-   else
-   {
-      m_tradeButton.Text("RUN");
-      m_tradeButton.ColorBackground(clrGreen);
-   }
+   m_tradeButton.Text("RUN");
+   m_tradeButton.ColorBackground(clrGreen);
 
+   // --- Close All Button (rechts) ---
    int x1_close = x2_trade + spacing;
    int x2_close = x1_close + btn_width;
 
@@ -111,12 +98,19 @@ int OnInit()
 //------------------------------------------------------------------
 void OnTick()
 {
+   // --- Pruefen, ob Handel erlaubt ist ---
    long marketStatus = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_MODE);
    if ((marketStatus & SYMBOL_TRADE_MODE_FULL) == 0)
    {
+       // Der EA sollte hier keine Order senden.
+       // SYMBOL_TRADE_MODE_FULL ist in der Regel 2, was den Vollhandel erlaubt.
+       // Wenn 0 oder SYMBOL_TRADE_MODE_CLOSE, ist der Markt zu.
+       
+       // Optional: Log-Eintrag zur Information
        if (isWarnEnabled)
            Print("[WARN]: OrderSend verhindert, da Markt geschlossen ist.");
-       return;
+       
+       return; // Die Funktion beenden, um den OrderSend-Aufruf zu verhindern
    }
    
    AktualisiereBuyOrders();
@@ -129,30 +123,38 @@ void OnTick()
       return;
    }
 
+   // --- 1. Keine offenen Orders ---
    if (OpenFirstOrder(orderCount, bid))
    {
       return;
    }
 
+   // --- 2. Spezialfall: Nur eine Position und im Gewinn ---
    if (HandleOnePositiveOrder(orderCount, bid))
    {
       return;
    }
 
+   // --- 3. Offene Orders: Anpassung des TP nach manueller Änderung ---
    changedAfterManualClosing();
 
+   // --- 4. Trailing SL ---
    UpdateTrailingSL();
 
-   if (orderCount > 0 && orderCount < MaxOrders)
-   {
+   // --- 5. Nachkauf-Logik ---
+    if (orderCount > 0 && orderCount < MaxOrders)
+    {
        double lastOpen = BuyOrders[orderCount - 1].openPrice;
        
+       // 1. Berechnung des dynamischen Abstands
        double dynamicAbstand = AbstandPips;
        if (orderCount > 1)
        {
+          // Der Abstand wird basierend auf dem Index der letzten Order (orderCount - 1) berechnet.
           dynamicAbstand = AbstandPips * MathPow(DistanceMultiplier, orderCount - 1);
        }
     
+       // 2. Prüfung: Ist der Abstand zur letzten Order groß genug?
        if ((lastOpen - bid) >= PipsToPrice(dynamicAbstand))
        {
           double lot = BerechneLot();
@@ -241,7 +243,7 @@ bool OpenFirstOrder(int &orderCount, double bid)
 }
 
 //------------------------------------------------------------------
-// IMPROVED: Trailing Stop-Loss Update with Spread Awareness
+// Trailing Stop-Loss Update
 //------------------------------------------------------------------
 void UpdateTrailingSL()
 {
@@ -252,34 +254,43 @@ void UpdateTrailingSL()
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double weightedPrice = BerechneWeightedEntryPrice();
 
+   // 1. Berechne den aktuellen Gewinn in Pips seit dem gewichteten Einstieg
+   // Da es Buy-Positionen sind, gilt: (Bid - gewichteter Einstieg) / Pip-Wert
    double currentProfitPips = (bid - weightedPrice) / pipValueCached;
+
+   // Aktivierungsschwelle: SL wird nur gesetzt, wenn der Gewinn die Trailing-Schwelle überschreitet.
+   // TrailingStopPips (z.B. 75 Pips) ist hier der MINIMALE Profit, den das Netz
+   // haben muss, damit der Stop-Loss aktiviert wird.
 
    if (currentProfitPips >= TrailingStopPips)
    {
-      // Calculate current spread
-      double currentSpread = ask - bid;
-      double spreadPips = currentSpread / pipValueCached;
-      
-      // Buffer must be: Spread + Safety margin (minimum 30 pips)
-      double minBufferPips = spreadPips + 30.0;
-      double actualBufferPips = MathMax(SLAfterBidPips, minBufferPips);
-      
-      if (isDebugEnabled && actualBufferPips > SLAfterBidPips)
-         PrintFormat("[DEBUG] SL buffer adjusted: %.0f → %.0f pips (spread: %.0f)", 
-                     SLAfterBidPips, actualBufferPips, spreadPips);
-      
-      double newSL = bid - PipsToPrice(actualBufferPips);
+      // 2. Berechnung des neuen SL-Preises: Bid-Preis minus Trailing-Abstand (in Pips)
+      // Der Abstand, den der SL zum aktuellen Preis hält, wird mit TrailingStopPips beibehalten.
+      double newSL = bid - PipsToPrice(SLAfterBidPips);
 
-      // Break-even guarantee with spread compensation
-      double safetyPufferPips = 50.0;
+      // NEUER SPREAD-AUSGLEICH
+      double currentSpread = ask - bid;
+
+      // 3. BREAK-EVEN-GARANTIE (Korrektur):
+      // Der Stop-Loss muss MINDESTENS den gewichteten Einstiegspreis abdecken.
+      // Wir ziehen den newSL nur nach, wenn er HÖHER ist als der aktuelle SL.
+
+      // FIX: Höherer Puffer für die einzelne Order, um Slippage und Kosten
+      // sicher abzudecken und ein negatives Schließen zu vermeiden.
+      double safetyPufferPips = 30.0;
       if (ArraySize(BuyOrders) == 1)
       {
-         safetyPufferPips = 80.0;
+         // 20 Pips Puffer für die Einzelorder, um garantierten Gewinn zu erzielen
+         safetyPufferPips = 50.0; 
       }
 
+      // Zuerst den Break-Even-Preis berechnen (Einstieg + minimaler Puffer für Kosten)
       double breakEvenPrice = weightedPrice + currentSpread + PipsToPrice(safetyPufferPips);
+
+      // Der neue SL ist der HÖHERE Wert aus (dem berechneten Trailing SL) und (dem Break-Even SL)
       double finalSL = MathMax(newSL, breakEvenPrice);
 
+      // 3. Nur nachziehen (SL nur erhöhen)
       if (finalSL > currentSLPrice)
       {
          currentSLPrice = finalSL;
@@ -296,25 +307,23 @@ void UpdateTrailingSL()
             req.sl = NormalizeDouble(currentSLPrice, _Digits);
             req.tp = NormalizeDouble(currentTPPrice, _Digits);
 
+            // Führe die Aktualisierung nur durch, wenn SL > 0 (nicht bei 0.0)
             if (currentSLPrice > 0.0)
             {
                OrderSend(req, res);
             }
          }
-         
-         if (isDebugEnabled)
-            PrintFormat("[DEBUG] Trailing SL updated to %.5f (buffer: %.0f pips)", currentSLPrice, actualBufferPips);
       }
    }
 }
 
+// --- Hilfsfunktion: State zurücksetzen ---
 void ResetState()
 {
    ArrayFree(BuyOrders);
    ClearAllObjects();
    highestBidSinceOpen = 0;
    currentTPPrice = 0;
-   currentSLPrice = 0;
    weightedEntryPrice = 0;
 }
 
@@ -325,13 +334,15 @@ double PipValue()
    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
 
-   // RoboForex XAUUSD: 2 digits → 1 pip = 0.01 = point
+   // --- Metalle (XAU, XAG, XPT, XPD, etc.) → 1 pip = point
    if (StringFind(_Symbol, "XAU") == 0 || StringFind(_Symbol, "XAG") == 0)
       return point;
 
-   if (digits == 3 || digits == 5)
+   // --- Standard-FX-Paare (z. B. EURUSD 1.08854 → 5 Digits) → 1 pip = 10 * point
+    if (digits == 3 || digits == 5)
       return point * 10.0;
 
+   // --- sonst (Indices, Krypto etc.) → 1 pip = point
    return point;
 }
 
@@ -358,31 +369,38 @@ double NormalizeLot(double lot)
 }
 
 //------------------------------------------------------------------
-// IMPROVED: Lot Calculation - Continue Martingale with MaxLot Cap
-//------------------------------------------------------------------
+// Lot-Berechnung für MT5 ProCent Accounts
+// Start = 0.01 Lot pro 100 USD (10.000 Cent)
+// Danach Martingale bis max. 10 Orders
+// Danach wieder BasisLot (z.B. 0.01)
 double BerechneLot()
 {
-   double balanceCent = AccountInfoDouble(ACCOUNT_EQUITY);
-   double balanceUSD = balanceCent / 100.0;
+   double balanceCent = AccountInfoDouble(ACCOUNT_EQUITY); // Balance in Cent
+   double balanceUSD = balanceCent / 100.0;                // Umrechnen in USD
    int orderIndex = ArraySize(BuyOrders);
 
+   // --- Startlot = 0.01 Lot pro 100 USD
    double startLot = balanceUSD * 0.0001;
    startLot = NormalizeLot(startLot);
-   
-   // Continue Martingale progression, capped at MaxLot
-   double lot = startLot * MathPow(Martingale, orderIndex);
-   
-   if (lot > MaxLot)
+   double lot = 0.00;
+
+   if (orderIndex < MaxOrderWithMartingale)
    {
-      lot = MaxLot; // Use MaxLot instead of resetting to startLot
-      
-      if (isWarnEnabled && orderIndex == MaxOrderWithMartingale)
-         PrintFormat("[INFO] Order %d reached MaxLot (%.2f), maintaining max size", orderIndex + 1, MaxLot);
+      // --- Martingale bis max. 10 Orders
+      lot = startLot * MathPow(Martingale, orderIndex);
+   }
+   else
+   {
+      // --- Ab der 11. Order wieder BasisLot
+      lot = startLot;
    }
 
-   if (isDebugEnabled)
-      PrintFormat("[DEBUG] Order %d: StartLot=%.5f, Calculated=%.5f, Final=%.5f", 
-                  orderIndex + 1, startLot, startLot * MathPow(Martingale, orderIndex), lot);
+   if (lot > MaxLot)
+   {
+      lot = startLot;
+   }
+
+   PrintFormat("StartLot = %.5f,  OderIndex= %.5f, Lot = %.5f", startLot, orderIndex, lot);
 
    return NormalizeLot(lot);
 }
@@ -420,7 +438,7 @@ void AktualisiereBuyOrders()
 }
 
 //------------------------------------------------------------------
-// Weighted Entry
+// Weighted Entry & gemeinsamer TP
 double BerechneWeightedEntryPrice()
 {
    double sumLots = 0.0, sumPriceLots = 0.0;
@@ -434,47 +452,111 @@ double BerechneWeightedEntryPrice()
    return sumPriceLots / sumLots;
 }
 
-//------------------------------------------------------------------
-// IMPROVED: Adaptive TP Calculation
-//------------------------------------------------------------------
+// Standard: gewichteter Einstieg + TakeProfitPips
 double BerechneGemeinsamenTPPrice(double tpPips)
 {
    double currentWeighted = BerechneWeightedEntryPrice();
    if (currentWeighted <= 0.0)
       return 0.0;
-   
-   int orderCount = ArraySize(BuyOrders);
-   double adaptiveTP = tpPips;
-   
-   // Adaptive TP: Scale with number of orders
-   if (UseAdaptiveTP && orderCount > 5)
-   {
-      // For every order beyond 5, add AdaptiveTPIncrement pips
-      // Example: Order 12 = 150 + (12-5)×30 = 360 pips
-      adaptiveTP = tpPips + ((orderCount - 5) * AdaptiveTPIncrement);
-      
-      if (isDebugEnabled)
-         PrintFormat("[DEBUG] Adaptive TP: %d orders → %.0f pips (base: %.0f, increment: %.0f)", 
-                     orderCount, adaptiveTP, tpPips, AdaptiveTPIncrement);
-   }
-   
-   return currentWeighted + PipsToPrice(adaptiveTP);
+   return currentWeighted + PipsToPrice(tpPips);
 }
 
 //------------------------------------------------------------------
-// Setze TP fuer alle Buys (mit Broker-Mindestabstand-Pruefung)
+// Setze TP fuer alle Buys (VERBESSERTE VERSION)
+//void SetzeTPForAll(double tpPrice)
+//{
+//   MqlTradeRequest req;
+//   MqlTradeResult res;
+//   
+//   // --- NEU: Broker-Anforderungen abrufen ---
+//   // Mindestabstand (in Pips/Points) für Stops
+//   int stopLevelPips = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+//   
+//   // Aktueller Marktpreis (Ask-Preis ist relevant für Buy-TP)
+//   double currentAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+//   
+//   // Umrechnung des Mindestabstands in einen Preis
+//   double minDistancePrice = (double)stopLevelPips * _Point;
+//   
+//   // --- NEU: Minimal erlaubter TP-Preis ---
+//   // Der TP muss MINDESTENS (Ask + Mindestabstand) sein.
+//   double minSafeTP = currentAsk + minDistancePrice;
+//
+//   // Den Ziel-TP normalisieren
+//   double normalizedTargetTP = NormalizeDouble(tpPrice, _Digits);
+//
+//   // --- NEU: Prüfen, ob der Ziel-TP sicher ist ---
+//   if (normalizedTargetTP < minSafeTP)
+//   {
+//      if (isDebugEnabled)
+//           PrintFormat("TP-Anpassung: Ziel-TP (%.5f) liegt innerhalb der Stop-Level-Zone (Min: %.5f). TP wird leicht erhöht.", 
+//                       normalizedTargetTP, minSafeTP);
+//                       
+//      // Den TP auf den minimal sicheren Abstand setzen, um [Invalid stops] zu vermeiden
+//      normalizedTargetTP = NormalizeDouble(minSafeTP + _Point, _Digits); 
+//   }
+//
+//
+//   for (int i = 0; i < ArraySize(BuyOrders); i++)
+//   {
+//      // --- NEU: Prüfen, ob ein Update überhaupt nötig ist ---
+//      double currentPositionTP = 0.0;
+//      double currentPositionSL = 0.0;
+//      
+//      if(PositionSelectByTicket(BuyOrders[i].ticket))
+//      {
+//         currentPositionTP = PositionGetDouble(POSITION_TP);
+//         currentPositionSL = PositionGetDouble(POSITION_SL);
+//      }
+//      
+//      // Nur senden, wenn sich der TP oder der SL ändert (vermeidet [No changes])
+//      if(MathAbs(currentPositionTP - normalizedTargetTP) > _Point || 
+//         MathAbs(currentPositionSL - currentSLPrice) > _Point)
+//      {
+//         ZeroMemory(req);
+//         ZeroMemory(res);
+//
+//         req.action = TRADE_ACTION_SLTP;
+//         req.position = BuyOrders[i].ticket;
+//         req.symbol = _Symbol;
+//         req.sl = NormalizeDouble(currentSLPrice, _Digits);
+//         req.tp = normalizedTargetTP; // Verwende den geprüften TP-Wert
+//
+//         if (OrderSend(req, res))
+//         {
+//            if (isDebugEnabled)
+//               PrintFormat("TP/SL aktualisiert fuer Ticket %I64u auf TP %.5f", BuyOrders[i].ticket, normalizedTargetTP);
+//         }
+//         else
+//         {
+//            if (res.comment != "No changes")
+//               if (isDebugEnabled)
+//                  PrintFormat("TP/SL-Update fehlgeschlagen fuer Ticket %I64u: %s", BuyOrders[i].ticket, res.comment);
+//         }
+//      }
+//   }
+//}
+
+//------------------------------------------------------------------
+// Setze TP fuer alle Buys (OPTIMIERTE VERSION: PRUEFT AUF BROKER-MINDESTABSTAND)
 void SetzeTPForAll(double tpPrice)
 {
     MqlTradeRequest req;
     MqlTradeResult res;
     
+    // --- NEU: Broker-Anforderungen abrufen ---
+    // 1. Mindestabstand (in Points) für Stops
     int stopLevelPoints = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
     
+    // 2. Aktueller Marktpreis
     double currentBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
     double currentAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
     
+    // 3. Umrechnung des Mindestabstands in einen Preis
     double minDistancePrice = (double)stopLevelPoints * _Point;
     
+    // --- TP-Prüfung (relevant für BUY: muss über Ask sein) ---
+    // Der TP muss MINDESTENS (Ask + Mindestabstand) sein.
     double minSafeTP = currentAsk + minDistancePrice;
     double normalizedTargetTP = NormalizeDouble(tpPrice, _Digits);
 
@@ -484,23 +566,31 @@ void SetzeTPForAll(double tpPrice)
              PrintFormat("[WARN] TP-Korrektur: Ziel-TP (%.5f) liegt zu nah am Ask (%.5f). Erhöht auf MinSafe: %.5f", 
                          normalizedTargetTP, currentAsk, minSafeTP);
                          
+        // TP auf minimal sicheren Abstand + einen Point Puffer setzen
         normalizedTargetTP = NormalizeDouble(minSafeTP + _Point, _Digits);  
     }
     
+    // --- SL-Prüfung (relevant für BUY: muss unter Bid sein) ---
+    // Der SL muss MAXIMAL (Bid - Mindestabstand) sein.
     double maxSafeSL = currentBid - minDistancePrice;
     double normalizedSL = NormalizeDouble(currentSLPrice, _Digits);
 
+    // Die Prüfung muss nur durchgeführt werden, wenn der SL *aktiv* ist (currentSLPrice > 0)
     if (normalizedSL > 0 && normalizedSL > maxSafeSL) 
     {
          if (isWarnEnabled)
              PrintFormat("[WARN] SL-Korrektur: Ziel-SL (%.5f) liegt zu nah am Bid (%.5f). Gesenkt auf MaxSafe: %.5f", 
                          normalizedSL, currentBid, maxSafeSL);
                          
+         // SL auf maximal sicheren Abstand - einen Point Puffer setzen
          normalizedSL = NormalizeDouble(maxSafeSL - _Point, _Digits); 
     }
 
+
     for (int i = 0; i < ArraySize(BuyOrders); i++)
     {
+        // --- Prüfen, ob ein Update überhaupt nötig ist ---
+        // Dies verhindert unnötige [No changes]-Meldungen und reduziert Serverlast
         double currentPositionTP = 0.0;
         double currentPositionSL = 0.0;
         
@@ -510,6 +600,7 @@ void SetzeTPForAll(double tpPrice)
             currentPositionSL = PositionGetDouble(POSITION_SL);
         }
         
+        // Nur senden, wenn sich der TP oder der SL tatsächlich ändert
         if(MathAbs(currentPositionTP - normalizedTargetTP) > _Point || 
            MathAbs(currentPositionSL - normalizedSL) > _Point)
         {
@@ -519,21 +610,24 @@ void SetzeTPForAll(double tpPrice)
             req.action = TRADE_ACTION_SLTP;
             req.position = BuyOrders[i].ticket;
             req.symbol = _Symbol;
-            req.sl = normalizedSL;
-            req.tp = normalizedTargetTP;
+            req.sl = normalizedSL;        // Verwende den geprüften SL-Wert
+            req.tp = normalizedTargetTP;  // Verwende den geprüften TP-Wert
 
             if (!OrderSend(req, res))
             {
+                // Warnung nur anzeigen, wenn es sich nicht um "No changes" handelt
                 if (res.comment != "No changes")
                 {
                     if (isWarnEnabled)
-                         PrintFormat("[WARN] TP/SL-Update fehlgeschlagen fuer Ticket %I64u: %s", BuyOrders[i].ticket, res.comment);
+                         PrintFormat("TP/SL-Update fehlgeschlagen fuer Ticket %I64u: %s", BuyOrders[i].ticket, res.comment);
+                    else if (isDebugEnabled)
+                         PrintFormat("TP/SL-Update fehlgeschlagen fuer Ticket %I64u: %s", BuyOrders[i].ticket, res.comment);
                 }
             }
             else
             {
                if (isDebugEnabled)
-                   PrintFormat("[DEBUG] TP/SL aktualisiert fuer Ticket %I64u auf SL %.5f / TP %.5f", BuyOrders[i].ticket, normalizedSL, normalizedTargetTP);
+                   PrintFormat("TP/SL aktualisiert fuer Ticket %I64u auf SL %.5f / TP %.5f", BuyOrders[i].ticket, normalizedSL, normalizedTargetTP);
             }
         }
     }
@@ -543,18 +637,14 @@ void SetzeTPForAll(double tpPrice)
 // Buy-Oeffnung
 bool OeffneBuy(double lots)
 {
-   string EAComment = "BuyMartingaleEA_v2.08";
+   string EAComment = "BuyMartingaleEA";
    trade.SetExpertMagicNumber((long)magicNumber);
    bool ok = trade.Buy(lots, NULL, 0, 0, 0, EAComment);
    if (!ok)
-   {
-      if (isWarnEnabled)
-         PrintFormat("[WARN] OeffneBuy fehlgeschlagen! Lots=%.2f, Error=%s", lots, trade.ResultComment());
-   }
-   else
-   {
-      PrintFormat("[INFO] BUY geoeffnet: %.2f Lots @ %.5f", lots, SymbolInfoDouble(_Symbol, SYMBOL_ASK));
-   }
+      if (isDebugEnabled)
+         PrintFormat("OeffneBuy fehlgeschlagen! Lots=%.2f, Comment=%s, Error=%s", lots, EAComment, trade.ResultComment());
+      else
+         PrintFormat("BUY geoeffnet: %.2f Lots @ %.5f", lots, SymbolInfoDouble(_Symbol, SYMBOL_ASK));
    return ok;
 }
 
@@ -574,25 +664,23 @@ void CloseAllBuys()
       req.volume = BuyOrders[i].lots;
       req.type = ORDER_TYPE_SELL;
       req.price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-      req.deviation = 50; // Increased from 10 to 50 for better fill rate
+      req.deviation = 10;
       req.magic = (long)magicNumber;
 
       if (!OrderSend(req, res))
-      {
-         if (isWarnEnabled)
-            PrintFormat("[WARN] Schliessen fehlgeschlagen fuer Ticket %I64u: %s", BuyOrders[i].ticket, res.comment);
-      }
-      else
-      {
-         PrintFormat("[INFO] BUY geschlossen fuer Ticket %I64u", BuyOrders[i].ticket);
-      }
+         if (isDebugEnabled)
+            PrintFormat("Schliessen fehlgeschlagen fuer Ticket %I64u: %s", BuyOrders[i].ticket, res.comment);
+         else
+            PrintFormat("BUY geschlossen fuer Ticket %I64u", BuyOrders[i].ticket);
    }
    
+   // Zyklus beendet → neuen Startpunkt setzen
    StartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
 }
 
-//------------------------------------------------------------------
-// IMPROVED: Drawdown Check with Margin Level Monitoring
+// ------------------------------------------------------------------
+// Prüft Drawdown relativ zum StartEquity und schließt alle Positionen
+// (Handel bleibt aktiv, es wird nichts deaktiviert)
 bool CheckAndHandleDrawdown()
 {
    if (StartEquity <= 0.0)
@@ -601,36 +689,23 @@ bool CheckAndHandleDrawdown()
    double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
    double loss = StartEquity - currentEquity;
    double lossPercent = (loss / StartEquity) * 100.0;
-   
-   // Also check margin level
-   double marginLevel = AccountInfoDouble(ACCOUNT_MARGIN_LEVEL);
-   bool marginCritical = (marginLevel < 150.0 && marginLevel > 0);
 
    if (lossPercent >= MaxDrawdownPercent)
    {
-      PrintFormat("[CRITICAL] DRAWDOWN %.2f%% >= %.2f%% -> Alle Positionen werden geschlossen!", lossPercent, MaxDrawdownPercent);
+      if (isDebugEnabled)
+         PrintFormat("DRAWNDOWN %.2f%% >= %.2f%% -> Alle Positionen werden geschlossen!", lossPercent, MaxDrawdownPercent);
 
+      // Alle offenen Positionen schließen
       AktualisiereBuyOrders();
       CloseAllBuys();
       ArrayFree(BuyOrders);
       ClearAllObjects();
 
+      // Neues StartEquity setzen, damit Drawdown nicht mehrfach auslöst
       StartEquity = currentEquity;
 
-      PrintFormat("[INFO] Alle Positionen geschlossen – Handel läuft weiter. Neues StartEquity=%.2f", StartEquity);
-      return true;
-   }
-   
-   if (marginCritical && ArraySize(BuyOrders) > 0)
-   {
-      PrintFormat("[CRITICAL] LOW MARGIN: %.2f%% - Schließe alle Positionen!", marginLevel);
-      
-      AktualisiereBuyOrders();
-      CloseAllBuys();
-      ArrayFree(BuyOrders);
-      ClearAllObjects();
-      
-      StartEquity = currentEquity;
+      if (isDebugEnabled)
+         PrintFormat("Alle Positionen geschlossen – Handel läuft weiter. Neues StartEquity=%.2f", StartEquity);
       return true;
    }
 
@@ -677,20 +752,7 @@ void DrawVisuals(double tpPrice)
    string tpName = "EA_TP_Line_" + _Symbol;
    ObjectCreate(0, tpName, OBJ_HLINE, 0, 0, tpPrice);
    ObjectSetInteger(0, tpName, OBJPROP_COLOR, clrTP);
-   ObjectSetInteger(0, tpName, OBJPROP_WIDTH, 2);
-   
-   // Add TP label
-   string tpLabel = "EA_TP_Label_" + _Symbol;
-   int orderCount = ArraySize(BuyOrders);
-   double tpPipsUsed = UseAdaptiveTP && orderCount > 5 ? 
-                       TakeProfitPips + ((orderCount - 5) * AdaptiveTPIncrement) : 
-                       TakeProfitPips;
-   string tpText = StringFormat("TP: %.2f (%.0f pips) | Orders: %d", tpPrice, tpPipsUsed, orderCount);
-   ObjectCreate(0, tpLabel, OBJ_TEXT, 0, TimeCurrent(), tpPrice);
-   ObjectSetString(0, tpLabel, OBJPROP_TEXT, tpText);
-   ObjectSetInteger(0, tpLabel, OBJPROP_COLOR, clrTP);
-   ObjectSetInteger(0, tpLabel, OBJPROP_FONTSIZE, 9);
-   ObjectSetInteger(0, tpLabel, OBJPROP_ANCHOR, ANCHOR_LEFT);
+   ObjectSetInteger(0, tpName, OBJPROP_WIDTH, 1);
 }
 
 // Klick auf Button abfangen
@@ -702,6 +764,7 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
       {
          isTrading = !isTrading;
 
+         // Toggle the button state und appearance
          if (isTrading)
          {
             m_tradeButton.Text("PAUSE");
@@ -716,9 +779,10 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
          if (isDebugEnabled)
             Print("[DEBUG] TRADING IS: " + (string)isTrading);
 
-         ChartRedraw(chartId);
+         ChartRedraw(chartId); // Update the chart
       }
 
+      // --- NEU: Button: Close All ---
       if (sparam == "CloseAllButton")
       {
          AktualisiereBuyOrders();
@@ -732,8 +796,10 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
 
          if (result == IDYES)
          {
-            Print("[INFO] Manuelles Schließen aller Positionen angefordert.");
+            Print("Manuelles Schließen aller Positionen angefordert.");
             CloseAllBuys();
+            
+            // BUGFIX: Internen Zustand nach manuellem Schließen zurücksetzen
             ResetState();
            
             m_tradeButton.Text("RUN");
@@ -748,20 +814,37 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
 //+------------------------------------------------------------------+
 int GetPersistentMagicNumber()
 {
+   // Name of the file where we store the magic number
    string filename = "magic_" + IntegerToString(chartId) + ".txt";
 
    if (isDebugEnabled)
       Print("[DEBUG] Magic Number file " + filename);
 
+   // --- Try to read existing magic number ---
    int fileHandle = FileOpen(filename, FILE_READ | FILE_TXT);
    if (fileHandle != INVALID_HANDLE)
    {
       magicNumber = (int)StringToInteger(FileReadString(fileHandle));
       if (isDebugEnabled)
-         Print("[DEBUG] Magic Number gelesen: " + (string)magicNumber);
+         Print("[DEBUG] LESE FILE " + (string)magicNumber);
       FileClose(fileHandle);
    }
 
+   // --- If not found, create a new one ---
    if (magicNumber == 0)
    {
-      MathSrand((uint)TimeLocal
+      MathSrand((uint)TimeLocal() + chartId);
+      magicNumber = (int)(100000 + MathRand() % 900000); // 6-digit number
+
+      fileHandle = FileOpen(filename, FILE_READ | FILE_WRITE | FILE_TXT);
+      if (fileHandle != INVALID_HANDLE)
+      {
+         if (isDebugEnabled)
+            Print("[DEBUG] SCHREIBE FILE " + (string)magicNumber);
+         FileWrite(fileHandle, magicNumber);
+         FileClose(fileHandle);
+      }
+   }
+
+   return magicNumber;
+}
